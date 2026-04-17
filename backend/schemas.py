@@ -70,6 +70,7 @@ class MessageOut(BaseModel):
     content: str
     thinking: str | None
     citations: list | None
+    tool_calls: list | None = None
     created_at: datetime
 
 

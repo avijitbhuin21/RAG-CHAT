@@ -41,6 +41,10 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text, nullable=False)
     thinking: Mapped[str | None] = mapped_column(Text, nullable=True)
     citations: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Ordered list of tool invocations the model made while producing this
+    # message: [{"name": "search_knowledge_base", "query": "..."}]. Stored so
+    # the "Searched knowledge base: ..." timeline row survives a page reload.
+    tool_calls: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 

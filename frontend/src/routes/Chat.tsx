@@ -2,7 +2,7 @@ import { ChevronDown, LogOut, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import ClaudeChatInput from '../components/ui/claude-style-chat-input';
-import { AssistantMessage, type AssistantMsg, type Citation, type ToolStatus } from '../components/chat/AssistantMessage';
+import { AssistantMessage, type AssistantMsg, type Citation, type ToolCall } from '../components/chat/AssistantMessage';
 import { SourcePanel, type SourcePanelTarget } from '../components/chat/SourcePanel';
 import { api } from '../lib/api';
 import { useSession } from '../lib/auth';
@@ -21,11 +21,10 @@ type Msg = {
   content: string;
   thinking: string | null;
   citations: Citation[] | null;
+  tool_calls: ToolCall[] | null;
   streaming?: boolean;
   thinkingStartedAt?: number | null;
   thinkingEndedAt?: number | null;
-  toolStatus?: ToolStatus;
-  toolQuery?: string | null;
 };
 
 export default function Chat() {
@@ -60,9 +59,16 @@ export default function Chat() {
     });
   }
 
-  // When we create a new chat we already know it's empty, so we skip the
-  // GET /messages round-trip that the activeId effect would otherwise fire.
-  const skipNextMessagesFetch = useRef(false);
+  const messageCache = useRef<Map<string, Msg[]>>(new Map());
+  const messagesRef = useRef<Msg[]>(messages);
+  const activeIdRef = useRef<string | null>(activeId);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
 
   async function refreshChats() {
     const list = await api<ChatSummary[]>('/chat/chats');
@@ -71,42 +77,51 @@ export default function Chat() {
   }
 
   async function loadMessages(chatId: string) {
+    const cached = messageCache.current.get(chatId);
+    if (cached) setMessages(cached);
+    const t0 = performance.now();
     const rows = await api<Msg[]>(`/chat/chats/${chatId}/messages`);
-    setMessages(rows.map((m) => ({ ...m, streaming: false })));
+    console.debug(
+      '[loadMessages]',
+      chatId,
+      `${(performance.now() - t0).toFixed(0)}ms`,
+    );
+    const fresh = rows.map((m) => ({ ...m, streaming: false }));
+    messageCache.current.set(chatId, fresh);
+    if (activeIdRef.current === chatId) setMessages(fresh);
   }
 
   useEffect(() => {
     refreshChats().then((list) => {
-      if (list.length > 0 && !activeId) setActiveId(list[0].id);
+      if (list.length > 0 && !activeIdRef.current) setActiveId(list[0].id);
     });
   }, []);
 
   useEffect(() => {
-    if (skipNextMessagesFetch.current) {
-      skipNextMessagesFetch.current = false;
-      return;
+    const chatId = activeId;
+    if (chatId) {
+      loadMessages(chatId);
+    } else {
+      setMessages([]);
     }
-    if (activeId) loadMessages(activeId);
-    else setMessages([]);
+    return () => {
+      if (chatId) messageCache.current.set(chatId, messagesRef.current);
+    };
   }, [activeId]);
 
   useEffect(() => {
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [messages]);
 
-  async function newChat() {
-    // Optimistic: insert + switch immediately; don't refetch the list.
-    const chat = await api<ChatSummary>('/chat/chats', { method: 'POST' });
-    setChats((prev) => [chat, ...prev]);
+  function newChat() {
+    setActiveId(null);
     setMessages([]);
-    skipNextMessagesFetch.current = true;
-    setActiveId(chat.id);
   }
 
   async function deleteChat(id: string) {
-    // Optimistic remove so the UI updates before the DB round-trip.
     const remaining = chats.filter((c) => c.id !== id);
     setChats(remaining);
+    messageCache.current.delete(id);
     if (activeId === id) setActiveId(remaining[0]?.id ?? null);
     try {
       await api(`/chat/chats/${id}`, { method: 'DELETE' });
@@ -133,6 +148,7 @@ export default function Chat() {
       content: userText,
       thinking: null,
       citations: null,
+      tool_calls: null,
     };
     const assistantMsg: Msg = {
       id: `tmp-asst-${Date.now()}`,
@@ -140,11 +156,10 @@ export default function Chat() {
       content: '',
       thinking: '',
       citations: null,
+      tool_calls: [],
       streaming: true,
       thinkingStartedAt: null,
       thinkingEndedAt: null,
-      toolStatus: null,
-      toolQuery: null,
     };
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
@@ -153,9 +168,7 @@ export default function Chat() {
       const chat = await api<ChatSummary>('/chat/chats', { method: 'POST' });
       chatId = chat.id;
       setChats((prev) => [chat, ...prev]);
-      // The activeId effect is about to fire — tell it not to refetch and
-      // wipe the optimistic state we just placed.
-      skipNextMessagesFetch.current = true;
+      messageCache.current.set(chatId, []);
       setActiveId(chatId);
     }
 
@@ -185,15 +198,41 @@ export default function Chat() {
               if (updated.thinkingStartedAt && !updated.thinkingEndedAt) {
                 updated.thinkingEndedAt = Date.now();
               }
-              updated.toolStatus = 'searching';
-              updated.toolQuery = event.query ?? null;
+              // Use `index` from the event to place this entry at the right
+              // slot. Parallel tool calls all start before any finishes, and
+              // done events may arrive out of order — matching on index
+              // prevents a "searching forever" sibling entry.
+              const existing = updated.tool_calls ?? [];
+              const copy = existing.slice();
+              const slot = typeof event.index === 'number' ? event.index : copy.length;
+              copy[slot] = { name: event.name, query: event.query ?? null, done: false };
+              updated.tool_calls = copy;
             } else if (event.type === 'tool_call_done') {
-              updated.toolStatus = 'done';
+              const calls = updated.tool_calls ?? [];
+              if (calls.length > 0) {
+                const copy = calls.slice();
+                // Prefer the explicit index; fall back to first not-yet-done
+                // entry (for any legacy events without it).
+                let slot =
+                  typeof event.index === 'number' ? event.index : -1;
+                if (slot < 0 || slot >= copy.length) {
+                  slot = copy.findIndex((c) => c && c.done === false);
+                }
+                if (slot >= 0 && copy[slot]) {
+                  copy[slot] = { ...copy[slot], done: true };
+                  updated.tool_calls = copy;
+                }
+              }
             } else if (event.type === 'content_delta') {
               if (updated.thinkingStartedAt && !updated.thinkingEndedAt) {
                 updated.thinkingEndedAt = Date.now();
               }
               updated.content = updated.content + event.content;
+            } else if (event.type === 'content_reset') {
+              // Backend hit a transient upstream error mid-stream and is
+              // retrying. Drop the partial answer so the retried output
+              // doesn't stack on top of the aborted one.
+              updated.content = '';
             } else if (event.type === 'done') {
               updated.id = event.message_id;
               updated.streaming = false;

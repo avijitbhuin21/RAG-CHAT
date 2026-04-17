@@ -12,6 +12,9 @@ import time
 from typing import AsyncIterator
 from uuid import UUID
 
+import anthropic
+import httpx
+
 from ..config import settings
 from ..db import SessionLocal
 from ..models import Chat, Message
@@ -19,6 +22,29 @@ from . import bifrost
 from . import qdrant as qdrant_svc
 
 log = logging.getLogger("task.chat")
+
+
+# Transient errors that indicate the upstream connection or server hiccuped
+# mid-call — safe to retry with the same inputs. `RemoteProtocolError` is the
+# chunked-encoding framing bug we saw on Bifrost mid-stream; the rest cover
+# the usual network / 5xx family. Anything else (4xx, auth, validation) is
+# our fault and shouldn't be retried.
+_TRANSIENT_EXC: tuple[type[BaseException], ...] = (
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.PoolTimeout,
+    anthropic.APIConnectionError,
+    anthropic.APITimeoutError,
+    anthropic.InternalServerError,
+    asyncio.TimeoutError,
+)
+
+MAX_LLM_ATTEMPTS = 3  # 1 initial try + 2 retries
 
 
 def _prefix(chat_id: UUID, user_email: str | None) -> str:
@@ -48,6 +74,9 @@ If you did not call the search tool, do NOT include any [n] markers.
 
 ## Tone and length
 Keep the tone professional and minimal. Answers should be brief and to the point — prefer a short paragraph or a tight bulleted list over long prose. No filler, no restating the question, no "let me know if you need anything else" sign-offs. Omit headings unless the answer genuinely has multiple distinct sections.
+
+## Opening style
+Never begin an answer with preamble like "Sure,", "Of course,", "Certainly,", "Let me look that up", "I'll search for that", "Let me check the documents", or similar filler. When you have searched, open directly with the substance — e.g., "Here is what I found:", "Based on the documents,", or simply state the answer. When no search was needed, just answer.
 
 ## Format
 Format answers in GitHub-flavored Markdown (**bold**, bullet lists, fenced code where helpful). Be faithful to the source material. If the excerpts don't contain enough information, say so plainly in a single sentence.
@@ -176,7 +205,11 @@ def _save_user_message(chat_id: UUID, content: str) -> None:
 
 
 def _save_assistant_message(
-    chat_id: UUID, content: str, thinking: str | None, citations: list
+    chat_id: UUID,
+    content: str,
+    thinking: str | None,
+    citations: list,
+    tool_calls: list,
 ) -> UUID:
     db = SessionLocal()
     try:
@@ -186,6 +219,7 @@ def _save_assistant_message(
             content=content,
             thinking=thinking,
             citations=citations,
+            tool_calls=tool_calls,
         )
         db.add(msg)
         db.flush()
@@ -269,6 +303,7 @@ async def stream_chat(
     content_buf: list[str] = []
     thinking_buf: list[str] = []
     citations: list = []
+    tool_calls: list[dict] = []
 
     yield {"type": "thinking_start"}
 
@@ -286,23 +321,45 @@ async def stream_chat(
     # a pre-tool text preamble — the user-visible answer comes from R2. We
     # still emit thinking/text as single chunks after R1 returns so the UI's
     # thinking panel stays populated.
-    final_r1 = await client.messages.create(
-        model=settings.BIFROST_LLM_MODEL,
-        max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=messages,
-        tools=[SEARCH_TOOL],
-        thinking={
-            "type": "enabled",
-            "budget_tokens": settings.THINKING_BUDGET_TOKENS,
-        },
-        extra_headers={"anthropic-beta": settings.BIFROST_ANTHROPIC_BETA},
-        # SDK refuses non-streaming calls whose estimated duration exceeds
-        # 10 min based on max_tokens (64k here). Pass an explicit timeout
-        # to skip that check — R1 is short in practice (thinking + a tool
-        # use block, not 64k of output).
-        timeout=600.0,
-    )
+    # Retry on transient upstream errors. R1 is blocking so no partial output
+    # needs to be rolled back — safe to just call again.
+    final_r1 = None
+    for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
+        try:
+            final_r1 = await client.messages.create(
+                model=settings.BIFROST_LLM_MODEL,
+                max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=messages,
+                tools=[SEARCH_TOOL],
+                thinking={
+                    "type": "enabled",
+                    "budget_tokens": settings.THINKING_BUDGET_TOKENS,
+                },
+                extra_headers={
+                    "anthropic-beta": settings.BIFROST_ANTHROPIC_BETA
+                },
+                # SDK refuses non-streaming calls whose estimated duration
+                # exceeds 10 min based on max_tokens (64k here). Pass an
+                # explicit timeout to skip that check — R1 is short in
+                # practice (thinking + a tool use block, not 64k of output).
+                timeout=600.0,
+            )
+            break
+        except _TRANSIENT_EXC as e:
+            if attempt == MAX_LLM_ATTEMPTS:
+                log.error(
+                    "%s R1 failed after %d attempts — surfacing: %r",
+                    prefix, attempt, e,
+                )
+                raise
+            backoff = 2 ** (attempt - 1)
+            log.warning(
+                "%s R1 transient error on attempt %d/%d: %r — retrying in %ds",
+                prefix, attempt, MAX_LLM_ATTEMPTS, e, backoff,
+            )
+            await asyncio.sleep(backoff)
+    assert final_r1 is not None
     for block in final_r1.content:
         btype = getattr(block, "type", None)
         if btype == "thinking":
@@ -338,31 +395,46 @@ async def stream_chat(
         # as a FRESH synthesis with the retrieved excerpts embedded
         # directly in the user message. Validated 5/5 successes,
         # ~1.2k char answers with proper [n] citations.
-        all_hits: list[dict] = []
-        for block in final_r1.content:
-            if block.type != "tool_use":
-                continue
+        # Anthropic's API allows the model to emit multiple tool_use blocks
+        # in a single turn (parallel tool use is on by default). Run those
+        # searches CONCURRENTLY via asyncio.gather — serialising them would
+        # block R2 on the slowest lookup and double the user-visible wait.
+        tool_blocks = [b for b in final_r1.content if b.type == "tool_use"]
+        tool_queries: list[tuple[str, str]] = []  # (name, query)
+        for idx, block in enumerate(tool_blocks):
             raw_input = block.input if isinstance(block.input, dict) else {}
             query = raw_input.get("query") or user_message
-
+            tool_queries.append((block.name, query))
+            tool_calls.append({"name": block.name, "query": query})
+            # Include `index` so the client can match this start with its
+            # matching tool_call_done — essential for parallel calls where
+            # the final "done" events don't necessarily arrive in start
+            # order, and marking-last would strand other entries as active.
             yield {
                 "type": "tool_call_start",
+                "index": idx,
                 "name": block.name,
                 "query": query,
             }
-            t_search = time.perf_counter()
-            hits = await _retrieve(query)
-            log.info(
-                "%s tool '%s' retrieved %d hits in %.2fs",
-                prefix,
-                block.name,
-                len(hits),
-                time.perf_counter() - t_search,
-            )
+
+        t_search = time.perf_counter()
+        hits_per_call = await asyncio.gather(
+            *[_retrieve(q) for _, q in tool_queries]
+        )
+        log.info(
+            "%s %d tool call(s) resolved in %.2fs (parallel)",
+            prefix,
+            len(tool_queries),
+            time.perf_counter() - t_search,
+        )
+
+        all_hits: list[dict] = []
+        for idx, ((name, _), hits) in enumerate(zip(tool_queries, hits_per_call)):
             all_hits.extend(hits)
             yield {
                 "type": "tool_call_done",
-                "name": block.name,
+                "index": idx,
+                "name": name,
                 "hit_count": len(hits),
             }
 
@@ -404,21 +476,60 @@ async def stream_chat(
             prefix,
             len(all_hits),
         )
+        # Snapshot buffer lengths so a mid-stream retry only rolls back R2's
+        # output, not anything already committed from R1 / tool emission.
+        r2_content_start = len(content_buf)
+        r2_thinking_start = len(thinking_buf)
+
+        final_r2 = None
         t_round2 = time.perf_counter()
-        async with client.messages.stream(
-            model=settings.BIFROST_LLM_MODEL,
-            max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
-            system=SYSTEM_PROMPT,
-            messages=r2_messages,
-        ) as stream2:
-            async for kind, payload in _handle_stream(stream2, f"{prefix} R2"):
-                if kind == "content":
-                    content_buf.append(payload)
-                    yield {"type": "content_delta", "content": payload}
-                elif kind == "thinking":
-                    thinking_buf.append(payload)
-                    yield {"type": "thinking_delta", "content": payload}
-            final_r2 = await stream2.get_final_message()
+        for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
+            try:
+                async with client.messages.stream(
+                    model=settings.BIFROST_LLM_MODEL,
+                    max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    messages=r2_messages,
+                ) as stream2:
+                    async for kind, payload in _handle_stream(
+                        stream2, f"{prefix} R2 attempt={attempt}"
+                    ):
+                        if kind == "content":
+                            content_buf.append(payload)
+                            yield {"type": "content_delta", "content": payload}
+                        elif kind == "thinking":
+                            thinking_buf.append(payload)
+                            yield {"type": "thinking_delta", "content": payload}
+                    final_r2 = await stream2.get_final_message()
+                break
+            except _TRANSIENT_EXC as e:
+                # Record how much we streamed before the failure so we can
+                # decide whether to retry (almost always yes) and so logs
+                # show the user-visible impact.
+                partial_chars = sum(
+                    len(p) for p in content_buf[r2_content_start:]
+                )
+                if attempt == MAX_LLM_ATTEMPTS:
+                    log.error(
+                        "%s R2 failed after %d attempts (partial=%d chars) — "
+                        "surfacing: %r",
+                        prefix, attempt, partial_chars, e,
+                    )
+                    raise
+                backoff = 2 ** (attempt - 1)
+                log.warning(
+                    "%s R2 stream error on attempt %d/%d (partial=%d chars): %r "
+                    "— retrying in %ds",
+                    prefix, attempt, MAX_LLM_ATTEMPTS, partial_chars, e, backoff,
+                )
+                # Discard the partial R2 output in our buffers AND tell the
+                # client to clear what it already rendered so the retried
+                # answer doesn't stack on top of the aborted one.
+                del content_buf[r2_content_start:]
+                del thinking_buf[r2_thinking_start:]
+                yield {"type": "content_reset", "reason": "retry", "attempt": attempt}
+                await asyncio.sleep(backoff)
+        assert final_r2 is not None
         log.info(
             "%s round 2 done in %.2fs | stop=%s blocks=%d",
             prefix,
@@ -438,7 +549,12 @@ async def stream_chat(
     )
 
     msg_id = await asyncio.to_thread(
-        _save_assistant_message, chat_id, content_s, thinking_s, citations
+        _save_assistant_message,
+        chat_id,
+        content_s,
+        thinking_s,
+        citations,
+        tool_calls,
     )
     log.info(
         "%s ====== done in %.2fs ======",

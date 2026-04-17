@@ -5,7 +5,6 @@ import {
   isValidElement,
   ReactNode,
   useEffect,
-  useRef,
   useState,
 } from 'react';
 import ReactMarkdown from 'react-markdown';
@@ -26,7 +25,13 @@ export type Citation = {
 
 export type OpenSourceFn = (c: Citation) => void;
 
-export type ToolStatus = 'searching' | 'done' | null;
+export type ToolCall = {
+  name?: string;
+  query: string | null;
+  // Live-streaming state only. Persisted calls loaded from history are always
+  // treated as done (omitted → done).
+  done?: boolean;
+};
 
 export type AssistantMsg = {
   id: string;
@@ -34,11 +39,10 @@ export type AssistantMsg = {
   content: string;
   thinking: string | null;
   citations: Citation[] | null;
+  tool_calls: ToolCall[] | null;
   streaming?: boolean;
   thinkingStartedAt?: number | null;
   thinkingEndedAt?: number | null;
-  toolStatus?: ToolStatus;
-  toolQuery?: string | null;
 };
 
 export function ShimmerText({ text }: { text: string }) {
@@ -71,7 +75,48 @@ function useElapsedSeconds(startedAt: number | null | undefined, frozen: number 
   return Math.max(0, (now - startedAt) / 1000);
 }
 
-function ThinkingPanel({
+// A single row in the vertical "reasoning timeline" that sits above the
+// answer. Renders a dot in the left gutter and a connecting vertical line
+// down to the next row (suppressed on the last row). Keeps alignment stable
+// regardless of whether the row's content is one line or expands into a
+// multi-line dropdown body.
+function TimelineRow({
+  done,
+  active,
+  isLast,
+  children,
+}: {
+  done: boolean;
+  active: boolean;
+  isLast: boolean;
+  children: ReactNode;
+}) {
+  return (
+    <div className="relative flex gap-3 pb-3 last:pb-0">
+      {!isLast && (
+        <span
+          className="absolute left-[5px] top-[18px] w-px bg-bg-300"
+          style={{ bottom: 0 }}
+          aria-hidden
+        />
+      )}
+      <span className="relative z-10 mt-[7px] flex h-2.5 w-2.5 shrink-0 items-center justify-center">
+        <span
+          className={`h-2.5 w-2.5 rounded-full ${
+            done
+              ? 'bg-accent'
+              : active
+                ? 'bg-accent/40 ring-2 ring-accent/30 animate-pulse'
+                : 'border border-accent bg-bg-0'
+          }`}
+        />
+      </span>
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  );
+}
+
+function ThoughtStep({
   thinking,
   startedAt,
   endedAt,
@@ -84,45 +129,38 @@ function ThinkingPanel({
 }) {
   const frozen = endedAt && startedAt ? (endedAt - startedAt) / 1000 : null;
   const elapsed = useElapsedSeconds(startedAt, frozen);
-  const seconds = Math.max(0, Math.round(elapsed));
+  // Floor at 1 — sub-second counters read as glitchy ("Thought for 0s").
+  const seconds = Math.max(1, Math.round(elapsed));
   const hasTiming = !!startedAt;
-  // Auto-expand while the model is actively thinking, auto-collapse once done.
-  // Track user override so they can manually toggle either way.
+  // Auto-expand while actively thinking, auto-collapse once done; user click
+  // overrides in either direction.
   const [userOverride, setUserOverride] = useState<boolean | null>(null);
   const open = userOverride != null ? userOverride : active;
-  const bodyRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (open && active && bodyRef.current) {
-      bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
-    }
-  }, [thinking, open, active]);
-
-  const headerLabel = active ? (
+  const label = active ? (
     <ShimmerText text={hasTiming ? `Thinking ${seconds}s` : 'Thinking…'} />
   ) : (
-    <span className="text-text-300">
+    <span className="text-sm text-text-300">
       {hasTiming ? `Thought for ${seconds}s` : 'Thinking'}
     </span>
   );
 
   return (
-    <div className="rounded-lg border border-bg-300 bg-bg-100/70 backdrop-blur-sm">
+    <div>
       <button
         type="button"
         onClick={() => setUserOverride(!open)}
-        className="flex w-full items-center justify-between px-3 py-2 text-xs"
+        className="flex items-center gap-1 text-left transition hover:text-text-100"
       >
-        {headerLabel}
+        {label}
         <ChevronDown
-          className={`h-3.5 w-3.5 text-text-400 transition-transform ${open ? '' : '-rotate-90'}`}
+          className={`h-3.5 w-3.5 text-text-400 transition-transform ${
+            open ? '' : '-rotate-90'
+          }`}
         />
       </button>
-      {open && (
-        <div
-          ref={bodyRef}
-          className="custom-scrollbar max-h-72 overflow-y-auto whitespace-pre-wrap border-t border-bg-300 px-3 py-2 text-xs leading-relaxed text-text-300"
-        >
+      {open && (thinking || active) && (
+        <div className="mt-1.5 whitespace-pre-wrap text-xs italic leading-relaxed text-text-400">
           {thinking || (active ? '…' : '')}
         </div>
       )}
@@ -130,17 +168,30 @@ function ThinkingPanel({
   );
 }
 
-function ToolCallPill({ status, query }: { status: ToolStatus; query: string | null }) {
-  if (!status) return null;
+function ToolStep({
+  call,
+}: {
+  call: ToolCall;
+}) {
+  const { query, done } = call;
+  const active = done === false;
   return (
-    <div className="inline-flex items-center gap-2 rounded-full border border-bg-300 bg-bg-100 px-3 py-1 text-xs text-text-300">
-      <Search className="h-3 w-3 text-accent" />
-      {status === 'searching' ? (
-        <ShimmerText text={`Searching knowledge base${query ? `: "${truncate(query, 40)}"` : '…'}`} />
+    <div className="flex items-center gap-2 py-[2px] text-sm text-text-300">
+      <Search className="h-3 w-3 shrink-0 text-accent" />
+      {active ? (
+        <ShimmerText
+          text={`Searching knowledge base${query ? `: "${truncate(query, 40)}"` : '…'}`}
+        />
       ) : (
         <span>
           Searched knowledge base
-          {query ? <>: <span className="text-text-200">"{truncate(query, 40)}"</span></> : ''}
+          {query ? (
+            <>
+              : <span className="text-text-200">"{truncate(query, 40)}"</span>
+            </>
+          ) : (
+            ''
+          )}
         </span>
       )}
     </div>
@@ -244,10 +295,16 @@ export function AssistantMessage({
   const isStreaming = !!msg.streaming;
   const hasContent = msg.content.length > 0;
   const hasThinking = (msg.thinking ?? '').length > 0;
-  const thinkingActive = isStreaming && hasThinking && !hasContent;
+  const toolCalls = msg.tool_calls ?? [];
+  const hasTools = toolCalls.length > 0;
 
-  const showInitialShimmer =
-    isStreaming && !hasContent && !hasThinking && !msg.toolStatus;
+  // Show the Thought row whenever we have any thinking content OR we're
+  // still waiting on the first token of anything else (so there's something
+  // on screen while the model warms up). Active = not yet finished its work.
+  const showThoughtRow =
+    hasThinking || (isStreaming && !hasContent && !hasTools);
+  const thoughtActive = isStreaming && !hasContent;
+  const thoughtDone = !thoughtActive;
 
   function handleCite(index: number) {
     const c = msg.citations?.find((x) => x.index === index);
@@ -266,19 +323,38 @@ export function AssistantMessage({
         />
       </div>
       <div className="min-w-0 flex-1 space-y-2">
-        {showInitialShimmer && <ShimmerText text="Thinking..." />}
-
-        {(hasThinking || (isStreaming && !hasContent && !msg.toolStatus)) &&
-          (hasThinking || !showInitialShimmer) && (
-            <ThinkingPanel
-              thinking={msg.thinking ?? ''}
-              startedAt={msg.thinkingStartedAt}
-              endedAt={msg.thinkingEndedAt}
-              active={thinkingActive}
-            />
-          )}
-
-        <ToolCallPill status={msg.toolStatus ?? null} query={msg.toolQuery ?? null} />
+        {(showThoughtRow || hasTools) && (
+          <div className="space-y-0">
+            {showThoughtRow && (
+              <TimelineRow
+                done={thoughtDone}
+                active={thoughtActive && !hasThinking}
+                isLast={!hasTools && !hasContent}
+              >
+                <ThoughtStep
+                  thinking={msg.thinking ?? ''}
+                  startedAt={msg.thinkingStartedAt}
+                  endedAt={msg.thinkingEndedAt}
+                  active={thoughtActive}
+                />
+              </TimelineRow>
+            )}
+            {toolCalls.map((call, i) => {
+              const isLastTool = i === toolCalls.length - 1;
+              const done = call.done !== false;
+              return (
+                <TimelineRow
+                  key={i}
+                  done={done}
+                  active={!done}
+                  isLast={isLastTool && !hasContent}
+                >
+                  <ToolStep call={call} />
+                </TimelineRow>
+              );
+            })}
+          </div>
+        )}
 
         {hasContent && (
           <div className="md-content">
