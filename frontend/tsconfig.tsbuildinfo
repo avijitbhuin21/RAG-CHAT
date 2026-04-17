@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/main.tsx","./src/components/chat/assistantmessage.tsx","./src/components/ui/claude-style-chat-input.tsx","./src/lib/api.ts","./src/lib/auth.tsx","./src/lib/stream.ts","./src/lib/utils.ts","./src/routes/admin.tsx","./src/routes/adminlogin.tsx","./src/routes/chat.tsx","./src/routes/login.tsx"],"version":"5.9.3"}
