@@ -1,4 +1,4 @@
-import { ChevronDown, FileText, Search } from 'lucide-react';
+import { ChevronDown, Search } from 'lucide-react';
 import {
   cloneElement,
   Fragment,
@@ -15,8 +15,16 @@ export type Citation = {
   index: number;
   filename: string;
   file_id: string | null;
-  snippet: string;
+  // Every retrieved chunk from this source file, used client-side to locate
+  // and highlight the cited passages inside the document in the side panel.
+  // `chunk_text` (single string) and `snippet` (truncated) are older formats
+  // kept as fallbacks when reading messages saved before the per-file change.
+  chunk_texts?: string[];
+  chunk_text?: string;
+  snippet?: string;
 };
+
+export type OpenSourceFn = (c: Citation) => void;
 
 export type ToolStatus = 'searching' | 'done' | null;
 
@@ -61,43 +69,6 @@ function useElapsedSeconds(startedAt: number | null | undefined, frozen: number 
   if (frozen != null) return frozen;
   if (!startedAt) return 0;
   return Math.max(0, (now - startedAt) / 1000);
-}
-
-/**
- * Progressively reveal `target` one character-batch at a time while `enabled`
- * is true, so the user sees a visible typing motion even when the upstream
- * provider delivers content in large chunks (Bifrost currently hands us the
- * full tail of a Sonnet response in 1-2 deltas). The moment `enabled` flips
- * to false (stream done) we snap to the full string — no content ever gets
- * hidden by the animation.
- */
-function useTypewriter(target: string, enabled: boolean): string {
-  const [visibleLen, setVisibleLen] = useState(target.length);
-
-  // When streaming ends OR the target shrank (component reused), snap.
-  useEffect(() => {
-    if (!enabled) setVisibleLen(target.length);
-    else if (visibleLen > target.length) setVisibleLen(target.length);
-  }, [enabled, target.length, visibleLen]);
-
-  useEffect(() => {
-    if (!enabled) return;
-    if (visibleLen >= target.length) return;
-    const remaining = target.length - visibleLen;
-    const step = Math.min(30, Math.max(1, Math.floor(remaining / 30)));
-    const t = setTimeout(
-      () => setVisibleLen((n) => Math.min(target.length, n + step)),
-      18,
-    );
-    return () => clearTimeout(t);
-  }, [enabled, target, visibleLen]);
-
-  // DIAGNOSTIC: log every render so we can confirm in DevTools whether the
-  // hook is actually running and advancing during streaming.
-  // eslint-disable-next-line no-console
-  console.debug('[typewriter]', { enabled, visibleLen, targetLen: target.length });
-
-  return target.slice(0, visibleLen);
 }
 
 function ThinkingPanel({
@@ -188,8 +159,8 @@ function CitationSup({
   onClick: (index: number) => void;
 }) {
   return (
-    <a
-      href={`#cite-${index}`}
+    <button
+      type="button"
       className="citation-sup"
       onClick={(e) => {
         e.preventDefault();
@@ -197,7 +168,7 @@ function CitationSup({
       }}
     >
       {index}
-    </a>
+    </button>
   );
 }
 
@@ -263,72 +234,14 @@ function makeMarkdownComponents(onCite: (i: number) => void) {
   };
 }
 
-function dedupeByFile(citations: Citation[]) {
-  const seen = new Map<string, { citation: Citation; indices: number[] }>();
-  for (const c of citations) {
-    const key = c.file_id || c.filename;
-    const existing = seen.get(key);
-    if (existing) existing.indices.push(c.index);
-    else seen.set(key, { citation: c, indices: [c.index] });
-  }
-  return Array.from(seen.values());
-}
-
-function CitationsList({
-  citations,
-  highlightIndex,
+export function AssistantMessage({
+  msg,
+  onOpenSource,
 }: {
-  citations: Citation[];
-  highlightIndex: number | null;
+  msg: AssistantMsg;
+  onOpenSource: OpenSourceFn;
 }) {
-  const grouped = dedupeByFile(citations);
-  return (
-    <div className="mt-3 rounded-lg border border-bg-300 bg-bg-100/70 p-3">
-      <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-text-400">
-        Sources
-      </div>
-      <ol className="space-y-1.5">
-        {grouped.map(({ citation, indices }) => {
-          const isHighlight =
-            highlightIndex != null && indices.includes(highlightIndex);
-          return (
-            <li
-              key={citation.file_id || citation.filename}
-              id={`cite-${indices[0]}`}
-              className={`flex items-start gap-2 rounded-md px-2 py-1 text-xs transition ${
-                isHighlight ? 'bg-accent/10 ring-1 ring-accent/40' : ''
-              }`}
-            >
-              <span className="mt-0.5 inline-flex shrink-0 items-center gap-1">
-                {indices.map((i) => (
-                  <span
-                    key={i}
-                    className="inline-flex h-5 min-w-[20px] items-center justify-center rounded bg-accent/15 px-1 font-semibold text-accent"
-                  >
-                    {i}
-                  </span>
-                ))}
-              </span>
-              <FileText className="mt-0.5 h-3.5 w-3.5 shrink-0 text-text-400" />
-              <span className="flex-1 truncate text-text-200" title={citation.filename}>
-                {citation.filename}
-              </span>
-            </li>
-          );
-        })}
-      </ol>
-    </div>
-  );
-}
-
-export function AssistantMessage({ msg }: { msg: AssistantMsg }) {
-  const [highlight, setHighlight] = useState<number | null>(null);
-
   const isStreaming = !!msg.streaming;
-  const displayedContent = useTypewriter(msg.content, isStreaming);
-  // hasContent follows the real buffer (not the typewriter output) so the
-  // content div mounts the instant text arrives from the stream; the
-  // typewriter just controls how much of it is visible inside that div.
   const hasContent = msg.content.length > 0;
   const hasThinking = (msg.thinking ?? '').length > 0;
   const thinkingActive = isStreaming && hasThinking && !hasContent;
@@ -337,10 +250,8 @@ export function AssistantMessage({ msg }: { msg: AssistantMsg }) {
     isStreaming && !hasContent && !hasThinking && !msg.toolStatus;
 
   function handleCite(index: number) {
-    setHighlight(index);
-    const el = document.getElementById(`cite-${index}`);
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    window.setTimeout(() => setHighlight(null), 1600);
+    const c = msg.citations?.find((x) => x.index === index);
+    if (c) onOpenSource(c);
   }
 
   const mdComponents = makeMarkdownComponents(handleCite);
@@ -372,14 +283,11 @@ export function AssistantMessage({ msg }: { msg: AssistantMsg }) {
         {hasContent && (
           <div className="md-content">
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-              {displayedContent}
+              {msg.content}
             </ReactMarkdown>
           </div>
         )}
 
-        {msg.citations && msg.citations.length > 0 && hasContent && (
-          <CitationsList citations={msg.citations} highlightIndex={highlight} />
-        )}
       </div>
     </div>
   );

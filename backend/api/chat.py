@@ -4,13 +4,15 @@ import logging
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..db import SessionLocal, get_db
-from ..models import Chat, Message
+from ..models import Chat, FileRecord, Message
 from ..schemas import ChatOut, MessageOut, SendMessageRequest
 from ..security import require_user, user_id_from_claims
+from ..services import s3 as s3_svc
 from ..services.chat_service import stream_chat
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -143,6 +145,88 @@ async def send_message(
             )
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@router.get("/files/{file_id}")
+async def get_file(
+    file_id: UUID,
+    name: str | None = None,
+    claims: dict = Depends(require_user),
+):
+    """Stream a source document so the citation side-panel can render it.
+    Any signed-in user can read any ingested file — the knowledge base is
+    shared, not per-user, so we don't restrict by chat membership.
+
+    We accept an optional `?name=` query param and use it as a fallback when
+    the file_id doesn't resolve — Qdrant can outlive Postgres (partial delete,
+    DB reset during dev, orphan chunks from an older ingest), which would
+    otherwise strand valid citations with a 404."""
+    log.info(
+        "GET /chat/files/%s name=%r requested by %s",
+        file_id,
+        name,
+        claims.get("email", "?"),
+    )
+
+    def _load() -> tuple[bytes, str, str] | None | str:
+        db = SessionLocal()
+        try:
+            row = db.query(FileRecord).filter_by(id=file_id).one_or_none()
+            if not row and name:
+                # ID lookup failed — fall back to filename so orphaned chunks
+                # whose file_id no longer matches still render.
+                row = (
+                    db.query(FileRecord)
+                    .filter_by(filename=name)
+                    .order_by(FileRecord.created_at.desc())
+                    .first()
+                )
+                if row:
+                    log.info(
+                        "file %s not found by id; matched by filename %r → id=%s",
+                        file_id,
+                        name,
+                        row.id,
+                    )
+            if not row:
+                total = db.query(FileRecord).count()
+                log.warning(
+                    "file not found: id=%s name=%r (FileRecord has %d rows)",
+                    file_id,
+                    name,
+                    total,
+                )
+                return None
+            try:
+                obj = s3_svc.client().get_object(
+                    Bucket=settings.S3_BUCKET, Key=row.s3_key
+                )
+            except Exception as e:
+                log.exception(
+                    "S3 get_object failed for file %s key=%s: %s",
+                    row.id,
+                    row.s3_key,
+                    e,
+                )
+                return f"s3_error:{e}"
+            return obj["Body"].read(), row.mime_type, row.filename
+        finally:
+            db.close()
+
+    result = await asyncio.to_thread(_load)
+    if result is None:
+        raise HTTPException(status_code=404, detail="file not found in database")
+    if isinstance(result, str):
+        raise HTTPException(status_code=502, detail=result)
+    data, mime_type, filename = result
+    return Response(
+        content=data,
+        media_type=mime_type or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
 
 
 @router.get("/health")

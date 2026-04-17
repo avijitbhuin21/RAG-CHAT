@@ -42,12 +42,15 @@ DO NOT call the tool for:
 When in doubt for a short conversational message, answer directly without searching.
 
 ## Citations
-When you DO use retrieved excerpts, cite them inline using numbered markers like [1] or [2] that match the excerpt numbers in the tool result. Multiple citations after the same claim: [1][2]. Place each citation immediately after the supporting clause, before its punctuation. Only cite excerpts you actually used in your answer.
+When you DO use retrieved excerpts, cite them inline using numbered markers like [1] or [2]. Each number identifies a SOURCE FILE, not a passage — if you draw multiple facts from the same file, reuse that file's number every time. Multiple files cited for the same claim: [1][2]. Place each citation immediately after the supporting clause, before its punctuation. Only cite files you actually used.
 
 If you did not call the search tool, do NOT include any [n] markers.
 
+## Tone and length
+Keep the tone professional and minimal. Answers should be brief and to the point — prefer a short paragraph or a tight bulleted list over long prose. No filler, no restating the question, no "let me know if you need anything else" sign-offs. Omit headings unless the answer genuinely has multiple distinct sections.
+
 ## Format
-Format answers in GitHub-flavored Markdown (headings, bullet lists, **bold**, fenced code where helpful). Be concise and faithful to the source material. If the excerpts don't contain enough information, say so plainly.
+Format answers in GitHub-flavored Markdown (**bold**, bullet lists, fenced code where helpful). Be faithful to the source material. If the excerpts don't contain enough information, say so plainly in a single sentence.
 """
 
 
@@ -77,13 +80,37 @@ SEARCH_TOOL = {
 }
 
 
-def _format_excerpts(hits: list[dict]) -> str:
-    if not hits:
+def _group_hits_by_file(hits: list[dict]) -> list[dict]:
+    """Collapse retrieved chunks into one entry per source file, preserving
+    the order files were first seen. Citation numbering is per-file so the
+    answer shows `[1]` for anything from file 1 regardless of how many chunks
+    inside that file were used."""
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    for h in hits:
+        fid = h.get("file_id")
+        key = str(fid) if fid else f"__name__:{h.get('filename')}"
+        if key not in groups:
+            groups[key] = {
+                "filename": h.get("filename") or "",
+                "file_id": str(fid) if fid else None,
+                "chunk_texts": [],
+            }
+            order.append(key)
+        text = h.get("chunk_text") or ""
+        if text:
+            groups[key]["chunk_texts"].append(text)
+    return [groups[k] for k in order]
+
+
+def _format_excerpts(grouped: list[dict]) -> str:
+    if not grouped:
         return "(no relevant excerpts found)"
-    return "\n\n".join(
-        f"[{i}] From {h['filename']}:\n{h['chunk_text']}"
-        for i, h in enumerate(hits, 1)
-    )
+    blocks: list[str] = []
+    for i, entry in enumerate(grouped, 1):
+        body = "\n\n---\n\n".join(entry["chunk_texts"])
+        blocks.append(f"[{i}] From {entry['filename']}:\n{body}")
+    return "\n\n".join(blocks)
 
 
 async def _retrieve(query: str, top_k: int = 6) -> list[dict]:
@@ -255,7 +282,11 @@ async def stream_chat(
     )
     t_round = time.perf_counter()
 
-    async with client.messages.stream(
+    # R1 is non-streaming: we don't want to progressively render thinking or
+    # a pre-tool text preamble — the user-visible answer comes from R2. We
+    # still emit thinking/text as single chunks after R1 returns so the UI's
+    # thinking panel stays populated.
+    final_r1 = await client.messages.create(
         model=settings.BIFROST_LLM_MODEL,
         max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
         system=SYSTEM_PROMPT,
@@ -266,15 +297,24 @@ async def stream_chat(
             "budget_tokens": settings.THINKING_BUDGET_TOKENS,
         },
         extra_headers={"anthropic-beta": settings.BIFROST_ANTHROPIC_BETA},
-    ) as stream:
-        async for kind, payload in _handle_stream(stream, f"{prefix} R1"):
-            if kind == "content":
-                content_buf.append(payload)
-                yield {"type": "content_delta", "content": payload}
-            elif kind == "thinking":
-                thinking_buf.append(payload)
-                yield {"type": "thinking_delta", "content": payload}
-        final_r1 = await stream.get_final_message()
+        # SDK refuses non-streaming calls whose estimated duration exceeds
+        # 10 min based on max_tokens (64k here). Pass an explicit timeout
+        # to skip that check — R1 is short in practice (thinking + a tool
+        # use block, not 64k of output).
+        timeout=600.0,
+    )
+    for block in final_r1.content:
+        btype = getattr(block, "type", None)
+        if btype == "thinking":
+            text = getattr(block, "thinking", "") or ""
+            if text:
+                thinking_buf.append(text)
+                yield {"type": "thinking_delta", "content": text}
+        elif btype == "text":
+            text = getattr(block, "text", "") or ""
+            if text:
+                content_buf.append(text)
+                yield {"type": "content_delta", "content": text}
 
     log.info(
         "%s round 1 done in %.2fs | stop=%s blocks=%d (%s)",
@@ -326,13 +366,17 @@ async def stream_chat(
                 "hit_count": len(hits),
             }
 
-        for i, h in enumerate(all_hits, 1):
+        # One citation per source file (not per chunk). The frontend uses
+        # chunk_texts[] to highlight every cited passage inside the opened
+        # document via normalized text search.
+        grouped = _group_hits_by_file(all_hits)
+        for i, entry in enumerate(grouped, 1):
             citations.append(
                 {
                     "index": i,
-                    "filename": h["filename"],
-                    "file_id": str(h["file_id"]) if h["file_id"] else None,
-                    "snippet": (h["chunk_text"] or "")[:240],
+                    "filename": entry["filename"],
+                    "file_id": entry["file_id"],
+                    "chunk_texts": entry["chunk_texts"],
                 }
             )
         yield {"type": "citations", "citations": citations}
@@ -343,10 +387,13 @@ async def stream_chat(
         # the current user turn as its LAST element — we replace it.
         composite = (
             f"{user_message}\n\n"
-            "Here are relevant excerpts retrieved from the knowledge base:\n\n"
-            f"{_format_excerpts(all_hits)}\n\n"
+            "Here are relevant excerpts retrieved from the knowledge base, "
+            "grouped by source file. Each [n] identifies a FILE — use the "
+            "same [n] for any information you take from that file, regardless "
+            "of which excerpt within it.\n\n"
+            f"{_format_excerpts(grouped)}\n\n"
             "Please answer the question above using these excerpts. "
-            "Include inline [n] citations matching the excerpt numbers."
+            "Include inline [n] citations matching the file numbers."
         )
         r2_messages = list(messages[:-1]) + [
             {"role": "user", "content": composite}

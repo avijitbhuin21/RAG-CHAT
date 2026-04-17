@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import ClaudeChatInput from '../components/ui/claude-style-chat-input';
 import { AssistantMessage, type AssistantMsg, type Citation, type ToolStatus } from '../components/chat/AssistantMessage';
+import { SourcePanel, type SourcePanelTarget } from '../components/chat/SourcePanel';
 import { api } from '../lib/api';
 import { useSession } from '../lib/auth';
 import { streamSSE } from '../lib/stream';
@@ -36,7 +37,28 @@ export default function Chat() {
   const [showSignOut, setShowSignOut] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [sourceTarget, setSourceTarget] = useState<SourcePanelTarget | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  function openSource(c: Citation) {
+    if (!c.file_id) return;
+    // Prefer the per-file chunk_texts[] emitted by the new backend. Fall back
+    // to the single-chunk `chunk_text` or truncated `snippet` so citations on
+    // messages saved before those format changes still open the panel.
+    const chunkTexts =
+      c.chunk_texts && c.chunk_texts.length > 0
+        ? c.chunk_texts
+        : c.chunk_text
+          ? [c.chunk_text]
+          : c.snippet
+            ? [c.snippet]
+            : [];
+    setSourceTarget({
+      fileId: c.file_id,
+      filename: c.filename,
+      chunkTexts,
+    });
+  }
 
   // When we create a new chat we already know it's empty, so we skip the
   // GET /messages round-trip that the activeId effect would otherwise fire.
@@ -334,7 +356,7 @@ export default function Chat() {
             <div ref={scrollRef} className="flex-1 overflow-y-auto bg-bg-0">
               <div className="mx-auto max-w-3xl space-y-6 px-6 py-8">
                 {messages.map((m) => (
-                  <MessageBubble key={m.id} msg={m} />
+                  <MessageBubble key={m.id} msg={m} onOpenSource={openSource} />
                 ))}
               </div>
             </div>
@@ -350,6 +372,8 @@ export default function Chat() {
           </>
         )}
       </main>
+
+      <SourcePanel target={sourceTarget} onClose={() => setSourceTarget(null)} />
 
       {pendingDeleteChat && (
         <div
@@ -434,7 +458,13 @@ export default function Chat() {
   );
 }
 
-function MessageBubble({ msg }: { msg: Msg }) {
+function MessageBubble({
+  msg,
+  onOpenSource,
+}: {
+  msg: Msg;
+  onOpenSource: (c: Citation) => void;
+}) {
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -444,5 +474,5 @@ function MessageBubble({ msg }: { msg: Msg }) {
       </div>
     );
   }
-  return <AssistantMessage msg={msg as AssistantMsg} />;
+  return <AssistantMessage msg={msg as AssistantMsg} onOpenSource={onOpenSource} />;
 }
