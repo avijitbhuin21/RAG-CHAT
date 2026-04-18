@@ -84,13 +84,18 @@ function TimelineRow({
   done,
   active,
   isLast,
+  showMarker,
   children,
 }: {
   done: boolean;
   active: boolean;
   isLast: boolean;
+  showMarker: boolean;
   children: ReactNode;
 }) {
+  if (!showMarker) {
+    return <div className="pb-3 last:pb-0">{children}</div>;
+  }
   return (
     <div className="relative flex gap-3 pb-3 last:pb-0">
       {!isLast && (
@@ -121,11 +126,13 @@ function ThoughtStep({
   startedAt,
   endedAt,
   active,
+  showChevron,
 }: {
   thinking: string;
   startedAt: number | null | undefined;
   endedAt: number | null | undefined;
   active: boolean;
+  showChevron: boolean;
 }) {
   const frozen = endedAt && startedAt ? (endedAt - startedAt) / 1000 : null;
   const elapsed = useElapsedSeconds(startedAt, frozen);
@@ -147,21 +154,25 @@ function ThoughtStep({
 
   return (
     <div>
-      <button
-        type="button"
-        onClick={() => setUserOverride(!open)}
-        className="flex items-center gap-1 text-left transition hover:text-text-100"
-      >
-        {label}
-        <ChevronDown
-          className={`h-3.5 w-3.5 text-text-400 transition-transform ${
-            open ? '' : '-rotate-90'
-          }`}
-        />
-      </button>
-      {open && (thinking || active) && (
+      {showChevron ? (
+        <button
+          type="button"
+          onClick={() => setUserOverride(!open)}
+          className="flex items-center gap-1 text-left transition hover:text-text-100"
+        >
+          {label}
+          <ChevronDown
+            className={`h-3.5 w-3.5 text-text-400 transition-transform ${
+              open ? '' : '-rotate-90'
+            }`}
+          />
+        </button>
+      ) : (
+        <div className="flex items-center gap-1">{label}</div>
+      )}
+      {open && thinking && (
         <div className="mt-1.5 whitespace-pre-wrap text-xs italic leading-relaxed text-text-400">
-          {thinking || (active ? '…' : '')}
+          {thinking}
         </div>
       )}
     </div>
@@ -282,6 +293,11 @@ function makeMarkdownComponents(onCite: (i: number) => void) {
     strong: wrap('strong'),
     em: wrap('em'),
     blockquote: wrap('blockquote'),
+    table: ({ children, ...rest }: any) => (
+      <div className="md-table-wrap">
+        <table {...rest}>{children}</table>
+      </div>
+    ),
   };
 }
 
@@ -322,7 +338,7 @@ export function AssistantMessage({
           className="h-full w-full object-contain p-1"
         />
       </div>
-      <div className="min-w-0 flex-1 space-y-2">
+      <div className="min-w-0 flex-1 space-y-2 pt-2">
         {(showThoughtRow || hasTools) && (
           <div className="space-y-0">
             {showThoughtRow && (
@@ -330,12 +346,14 @@ export function AssistantMessage({
                 done={thoughtDone}
                 active={thoughtActive && !hasThinking}
                 isLast={!hasTools && !hasContent}
+                showMarker={hasContent}
               >
                 <ThoughtStep
                   thinking={msg.thinking ?? ''}
                   startedAt={msg.thinkingStartedAt}
                   endedAt={msg.thinkingEndedAt}
                   active={thoughtActive}
+                  showChevron={hasContent}
                 />
               </TimelineRow>
             )}
@@ -348,6 +366,7 @@ export function AssistantMessage({
                   done={done}
                   active={!done}
                   isLast={isLastTool && !hasContent}
+                  showMarker={hasContent}
                 >
                   <ToolStep call={call} />
                 </TimelineRow>

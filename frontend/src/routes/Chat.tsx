@@ -1,4 +1,4 @@
-import { ChevronDown, LogOut, Plus, Trash2 } from 'lucide-react';
+import { ChevronDown, LogOut, Menu, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 
 import ClaudeChatInput from '../components/ui/claude-style-chat-input';
@@ -35,6 +35,7 @@ export default function Chat() {
   const [sending, setSending] = useState(false);
   const [showSignOut, setShowSignOut] = useState(false);
   const [historyOpen, setHistoryOpen] = useState(true);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [sourceTarget, setSourceTarget] = useState<SourcePanelTarget | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -116,6 +117,12 @@ export default function Chat() {
   function newChat() {
     setActiveId(null);
     setMessages([]);
+    setSidebarOpen(false);
+  }
+
+  function selectChat(id: string) {
+    setActiveId(id);
+    setSidebarOpen(false);
   }
 
   async function deleteChat(id: string) {
@@ -268,9 +275,19 @@ export default function Chat() {
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
 
   return (
-    <div className="flex h-screen">
-      <aside className="flex w-64 flex-col border-r border-border bg-muted/40">
-        <div className="border-b border-border px-4 py-2 pl-16">
+    <div className="flex h-[100dvh]">
+      {sidebarOpen && (
+        <div
+          className="fixed inset-0 z-30 bg-black/40 md:hidden animate-fade-in"
+          onClick={() => setSidebarOpen(false)}
+        />
+      )}
+      <aside
+        className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-border bg-muted transform transition-transform duration-200 md:static md:w-64 md:translate-x-0 md:bg-muted/40 ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        <div className="border-b border-border px-4 py-2 md:pl-16">
           <img src="/logo.png" alt="1stAId4SME" className="h-8 w-auto" />
         </div>
 
@@ -302,7 +319,7 @@ export default function Chat() {
                 return (
                   <div
                     key={c.id}
-                    onClick={() => setActiveId(c.id)}
+                    onClick={() => selectChat(c.id)}
                     className={`group relative flex items-center gap-2 overflow-hidden rounded-md px-3 py-2 text-sm cursor-pointer transition ${
                       isActive
                         ? 'text-foreground font-semibold'
@@ -322,7 +339,7 @@ export default function Chat() {
                         setPendingDeleteId(c.id);
                       }}
                       title="Delete chat"
-                      className="relative rounded p-1 text-muted-foreground opacity-0 transition hover:bg-bg-200 hover:text-red-600 group-hover:opacity-100"
+                      className="relative rounded p-1 text-muted-foreground opacity-100 transition hover:bg-bg-200 hover:text-red-600 md:opacity-0 md:group-hover:opacity-100"
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </button>
@@ -355,7 +372,26 @@ export default function Chat() {
         </div>
       </aside>
 
-      <main className="flex flex-1 flex-col bg-bg-0">
+      <main className="flex min-w-0 flex-1 flex-col bg-bg-0">
+        <div className="flex items-center justify-between border-b border-border bg-bg-100/80 px-3 py-2 backdrop-blur md:hidden">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            title="Open menu"
+            className="rounded-md p-2 text-text-200 transition hover:bg-muted"
+          >
+            <Menu className="h-5 w-5" />
+          </button>
+          <img src="/logo.png" alt="1stAId4SME" className="h-7 w-auto" />
+          <button
+            type="button"
+            onClick={newChat}
+            title="New chat"
+            className="rounded-md p-2 text-text-200 transition hover:bg-muted"
+          >
+            <Plus className="h-5 w-5" />
+          </button>
+        </div>
         {isEmpty ? (
           <div className="flex flex-1 flex-col items-center justify-center px-4 py-8">
             <div className="mb-8 text-center animate-fade-in">
@@ -387,24 +423,24 @@ export default function Chat() {
             <ClaudeChatInput
               onSendMessage={({ message }) => send(message)}
               disabled={sending}
-              placeholder="Ask anything about the knowledge base…"
+              placeholder="Ask a question…"
             />
           </div>
         ) : (
           <>
             <div ref={scrollRef} className="flex-1 overflow-y-auto bg-bg-0">
-              <div className="mx-auto max-w-3xl space-y-6 px-6 py-8">
+              <div className="mx-auto max-w-3xl space-y-6 px-4 py-6 sm:px-6 sm:py-8">
                 {messages.map((m) => (
                   <MessageBubble key={m.id} msg={m} onOpenSource={openSource} />
                 ))}
               </div>
             </div>
 
-            <footer className="bg-bg-0 pb-4 pt-2">
+            <footer className="bg-bg-0 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2">
               <ClaudeChatInput
                 onSendMessage={({ message }) => send(message)}
                 disabled={sending}
-                placeholder="Ask anything about the knowledge base…"
+                placeholder="Ask a question…"
                 showFooterNote={false}
               />
             </footer>
@@ -507,7 +543,7 @@ function MessageBubble({
   if (msg.role === 'user') {
     return (
       <div className="flex justify-end">
-        <div className="max-w-[85%] rounded-lg bg-primary px-4 py-2.5 text-sm text-primary-foreground">
+        <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-lg bg-primary px-4 py-2.5 text-sm text-primary-foreground">
           {msg.content}
         </div>
       </div>

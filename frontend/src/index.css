@@ -85,6 +85,17 @@
   font-size: 0.95rem;
   line-height: 1.65;
   color: hsl(var(--foreground));
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.md-table-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+}
+.md-table-wrap table {
+  width: max-content;
+  min-width: 100%;
 }
 .md-content > * + * { margin-top: 0.75rem; }
 .md-content p { margin: 0; }

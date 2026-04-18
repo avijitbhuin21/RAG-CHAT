@@ -195,7 +195,7 @@ export function SourcePanel({
   return (
     <aside
       ref={panelRef}
-      className="pointer-events-auto fixed right-0 top-0 z-40 flex h-screen w-full max-w-[640px] flex-col border-l border-border bg-bg-0 shadow-2xl animate-slide-in-right"
+      className="pointer-events-auto fixed right-0 top-0 z-50 flex h-[100dvh] w-full flex-col border-l border-border bg-bg-0 shadow-2xl animate-slide-in-right sm:max-w-[640px]"
     >
       <header className="flex items-center gap-2 border-b border-border bg-bg-100 px-4 py-3">
         <FileText className="h-4 w-4 shrink-0 text-accent" />
@@ -291,7 +291,7 @@ function TextViewer({
   if (!text) return null;
   if (ranges.length === 0) {
     return (
-      <pre className="whitespace-pre-wrap p-6 font-mono text-xs text-text-200">
+      <pre className="whitespace-pre-wrap p-4 font-mono text-xs text-text-200 sm:p-6">
         {text}
       </pre>
     );
@@ -317,7 +317,7 @@ function TextViewer({
   }
 
   return (
-    <pre className="whitespace-pre-wrap p-6 font-mono text-xs leading-relaxed text-text-200">
+    <pre className="whitespace-pre-wrap p-4 font-mono text-xs leading-relaxed text-text-200 sm:p-6">
       {segments}
     </pre>
   );
@@ -350,7 +350,7 @@ function DocxViewer({
   return (
     <div
       ref={containerRef}
-      className="docx-content max-w-none p-6 text-sm leading-relaxed text-text-200 [&_h1]:mb-2 [&_h1]:mt-4 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:mb-2 [&_h2]:mt-3 [&_h2]:text-lg [&_h2]:font-semibold [&_h3]:mb-1 [&_h3]:mt-3 [&_h3]:text-base [&_h3]:font-semibold [&_p]:my-2 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_li]:my-0.5 [&_strong]:font-semibold [&_em]:italic [&_table]:my-3 [&_table]:border-collapse [&_td]:border [&_td]:border-bg-300 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-bg-300 [&_th]:bg-bg-100 [&_th]:px-2 [&_th]:py-1"
+      className="docx-content max-w-none p-4 text-sm leading-relaxed text-text-200 sm:p-6 [&_h1]:mb-2 [&_h1]:mt-4 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:mb-2 [&_h2]:mt-3 [&_h2]:text-lg [&_h2]:font-semibold [&_h3]:mb-1 [&_h3]:mt-3 [&_h3]:text-base [&_h3]:font-semibold [&_p]:my-2 [&_ul]:my-2 [&_ul]:list-disc [&_ul]:pl-6 [&_ol]:my-2 [&_ol]:list-decimal [&_ol]:pl-6 [&_li]:my-0.5 [&_strong]:font-semibold [&_em]:italic [&_table]:my-3 [&_table]:border-collapse [&_td]:border [&_td]:border-bg-300 [&_td]:px-2 [&_td]:py-1 [&_th]:border [&_th]:border-bg-300 [&_th]:bg-bg-100 [&_th]:px-2 [&_th]:py-1"
     />
   );
 }
@@ -422,6 +422,8 @@ function PdfViewer({
   chunkTexts: string[];
 }) {
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [cssWidth, setCssWidth] = useState<number>(608);
 
   useEffect(() => {
     let cancelled = false;
@@ -441,6 +443,19 @@ function PdfViewer({
     };
   }, [blob]);
 
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = Math.floor(entry.contentRect.width);
+        if (w > 0) setCssWidth(Math.min(608, w));
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   if (!pdf) {
     return (
       <div className="flex h-full items-center justify-center text-text-400">
@@ -450,9 +465,15 @@ function PdfViewer({
   }
   const pages = Array.from({ length: pdf.numPages }, (_, i) => i + 1);
   return (
-    <div className="space-y-4 p-4">
+    <div ref={wrapRef} className="space-y-4 p-2 sm:p-4">
       {pages.map((p) => (
-        <PdfPage key={p} pdf={pdf} pageNumber={p} chunkTexts={chunkTexts} />
+        <PdfPage
+          key={p}
+          pdf={pdf}
+          pageNumber={p}
+          chunkTexts={chunkTexts}
+          cssWidth={cssWidth}
+        />
       ))}
     </div>
   );
@@ -462,10 +483,12 @@ function PdfPage({
   pdf,
   pageNumber,
   chunkTexts,
+  cssWidth,
 }: {
   pdf: PDFDocumentProxy;
   pageNumber: number;
   chunkTexts: string[];
+  cssWidth: number;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -476,8 +499,6 @@ function PdfPage({
     (async () => {
       const page = await pdf.getPage(pageNumber);
       if (cancelled) return;
-      // CSS-pixel size the page will occupy in the panel.
-      const cssWidth = 608;
       const unscaled = page.getViewport({ scale: 1 });
       const cssScale = cssWidth / unscaled.width;
       // Render the canvas backing store at devicePixelRatio so high-DPI
@@ -573,7 +594,7 @@ function PdfPage({
     return () => {
       cancelled = true;
     };
-  }, [pdf, pageNumber, chunkTexts]);
+  }, [pdf, pageNumber, chunkTexts, cssWidth]);
 
   return (
     <div

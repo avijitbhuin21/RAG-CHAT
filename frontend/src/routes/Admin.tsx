@@ -228,10 +228,10 @@ export default function Admin() {
   }
 
   return (
-    <main className="mx-auto max-w-5xl p-8">
-      <header className="flex items-center justify-between">
+    <main className="mx-auto max-w-5xl p-4 sm:p-6 md:p-8">
+      <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <h1 className="text-2xl font-semibold tracking-tight text-foreground">
+          <h1 className="text-xl font-semibold tracking-tight text-foreground sm:text-2xl">
             Admin · Knowledge base
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">
@@ -241,7 +241,7 @@ export default function Admin() {
         <button
           type="button"
           onClick={logoutAdmin}
-          className="rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:bg-muted"
+          className="self-start rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:bg-muted sm:self-auto"
         >
           Sign out
         </button>
@@ -255,7 +255,7 @@ export default function Admin() {
             handleFiles(e.dataTransfer.files);
           }}
           onClick={() => fileInput.current?.click()}
-          className="cursor-pointer rounded-lg border-2 border-dashed border-border bg-background p-10 text-center transition hover:border-primary/50 hover:bg-accent/20"
+          className="cursor-pointer rounded-lg border-2 border-dashed border-border bg-background p-6 text-center transition hover:border-primary/50 hover:bg-accent/20 sm:p-10"
         >
           <p className="text-sm font-medium text-foreground">
             Drop files here or click to browse
@@ -331,21 +331,21 @@ export default function Admin() {
                   ? Math.round((f.stage_current / f.stage_total) * 100)
                   : 0;
               return (
-                <li key={f.id} className="flex items-center gap-4 px-4 py-3">
+                <li key={f.id} className="flex items-center gap-3 px-4 py-3 sm:gap-4">
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate text-sm font-medium text-foreground">
+                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                      <span className="min-w-0 truncate text-sm font-medium text-foreground">
                         {f.filename}
                       </span>
                       <span
-                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                        className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${
                           STATUS_TONE[f.status] ?? 'bg-muted text-muted-foreground'
                         }`}
                       >
                         {STATUS_LABEL[f.status] ?? f.status}
                       </span>
                     </div>
-                    <div className="mt-0.5 flex items-center gap-3 text-xs text-muted-foreground">
+                    <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                       <span>{humanSize(f.size_bytes)}</span>
                       {inFlight && f.stage_total > 0 && (
                         <span>
@@ -353,7 +353,7 @@ export default function Admin() {
                         </span>
                       )}
                       {f.status === 'failed' && f.error_message && (
-                        <span className="text-red-600">{f.error_message}</span>
+                        <span className="break-all text-red-600">{f.error_message}</span>
                       )}
                     </div>
                     {inFlight && (
@@ -368,7 +368,7 @@ export default function Admin() {
                   <button
                     type="button"
                     onClick={() => del(f.id)}
-                    className="rounded-md border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground transition hover:border-red-200 hover:bg-red-50 hover:text-red-700"
+                    className="shrink-0 rounded-md border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground transition hover:border-red-200 hover:bg-red-50 hover:text-red-700"
                   >
                     Delete
                   </button>
@@ -379,7 +379,7 @@ export default function Admin() {
         )}
       </section>
 
-      <div className="pointer-events-none fixed bottom-6 right-6 z-40 flex w-full max-w-sm flex-col gap-2">
+      <div className="pointer-events-none fixed inset-x-4 bottom-4 z-40 flex flex-col gap-2 sm:inset-x-auto sm:bottom-6 sm:right-6 sm:w-full sm:max-w-sm">
         {toasts.map((t) => (
           <div
             key={t.id}
