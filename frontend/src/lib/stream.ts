@@ -1,3 +1,5 @@
+import { API_BASE } from './apiBase';
+
 export type UploadProgress = { loaded: number; total: number };
 
 export function uploadWithProgress(
@@ -7,7 +9,7 @@ export function uploadWithProgress(
 ): Promise<{ status: number; body: unknown }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api${path}`);
+    xhr.open('POST', `${API_BASE}${path}`);
     xhr.withCredentials = true;
     xhr.upload.addEventListener('progress', (e) => {
       if (e.lengthComputable) onProgress({ loaded: e.loaded, total: e.total });
@@ -29,7 +31,7 @@ export async function streamSSE(
   init: RequestInit,
   onEvent: (event: any) => void,
 ): Promise<void> {
-  const res = await fetch(`/api${path}`, { ...init, credentials: 'include' });
+  const res = await fetch(`${API_BASE}${path}`, { ...init, credentials: 'include' });
   if (!res.ok || !res.body) {
     throw new Error(`stream failed: ${res.status}`);
   }

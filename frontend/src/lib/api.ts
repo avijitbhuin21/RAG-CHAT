@@ -1,3 +1,5 @@
+import { API_BASE } from './apiBase';
+
 export class ApiError extends Error {
   constructor(public status: number, message: string, public body?: unknown) {
     super(message);
@@ -17,7 +19,7 @@ export async function api<T = unknown>(path: string, opts: Options = {}): Promis
     },
     body: json !== undefined ? JSON.stringify(json) : opts.body,
   };
-  const res = await fetch(`/api${path}`, init);
+  const res = await fetch(`${API_BASE}${path}`, init);
   // Read the body as text exactly once. Reading it twice (e.g. res.json()
   // followed by res.text() in a catch block) throws "body stream already
   // read" because fetch locks the stream after the first read attempt --

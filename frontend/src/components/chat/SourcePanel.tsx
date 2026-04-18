@@ -11,6 +11,7 @@ import * as pdfjsLib from 'pdfjs-dist';
 import type { PDFDocumentProxy, TextItem } from 'pdfjs-dist/types/src/display/api';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import mammoth from 'mammoth';
+import { API_BASE } from '@/lib/apiBase';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -168,7 +169,7 @@ export function SourcePanel({
     setLoading(true);
     const ac = new AbortController();
     fetch(
-      `/api/chat/files/${target.fileId}?name=${encodeURIComponent(target.filename)}`,
+      `${API_BASE}/chat/files/${target.fileId}?name=${encodeURIComponent(target.filename)}`,
       { credentials: 'include', signal: ac.signal },
     )
       .then(async (r) => {
