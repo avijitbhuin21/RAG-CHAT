@@ -64,6 +64,10 @@ export default function Chat() {
   const messageCache = useRef<Map<string, Msg[]>>(new Map());
   const messagesRef = useRef<Msg[]>(messages);
   const activeIdRef = useRef<string | null>(activeId);
+  // Chats created inline from the welcome screen — their state is owned by
+  // the active send() call, so the activeId effect must not refetch and
+  // overwrite the optimistic messages with an empty GET response.
+  const inlineCreatedRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -102,7 +106,9 @@ export default function Chat() {
   useEffect(() => {
     const chatId = activeId;
     if (chatId) {
-      loadMessages(chatId);
+      if (!inlineCreatedRef.current.has(chatId)) {
+        loadMessages(chatId);
+      }
     } else {
       setMessages([]);
     }
@@ -176,7 +182,7 @@ export default function Chat() {
       const chat = await api<ChatSummary>('/chat/chats', { method: 'POST' });
       chatId = chat.id;
       setChats((prev) => [chat, ...prev]);
-      messageCache.current.set(chatId, []);
+      inlineCreatedRef.current.add(chatId);
       setActiveId(chatId);
     }
 
@@ -264,6 +270,7 @@ export default function Chat() {
       });
     } finally {
       setSending(false);
+      if (chatId) inlineCreatedRef.current.delete(chatId);
       refreshChats();
     }
   }

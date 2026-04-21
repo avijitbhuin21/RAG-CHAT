@@ -425,6 +425,16 @@ function PdfViewer({
   const [pdf, setPdf] = useState<PDFDocumentProxy | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const [cssWidth, setCssWidth] = useState<number>(608);
+  // Ranges resolved against the whole document's concatenated text, then
+  // split per page. Matching globally avoids two failure modes that the
+  // per-page approach hit: (1) chunks that span a page boundary matched no
+  // page at all, and (2) the prefix-fallback in findChunkRange would
+  // opportunistically latch onto a short prefix on an unrelated page —
+  // usually page 1 headers — producing spurious highlights there.
+  const [pageRanges, setPageRanges] = useState<Map<number, [number, number][]>>(
+    new Map(),
+  );
+  const scrolledRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -457,6 +467,57 @@ function PdfViewer({
     return () => ro.disconnect();
   }, []);
 
+  useEffect(() => {
+    if (!pdf) return;
+    scrolledRef.current = false;
+    let cancelled = false;
+    (async () => {
+      // Must reconstruct each page's text the same way PdfPage does so the
+      // global offsets we hand back line up with what PdfPage rebuilds when
+      // placing bounding boxes — see the concat loop in PdfPage.
+      const pages: { pageNumber: number; length: number; globalStart: number }[] = [];
+      let global = '';
+      for (let p = 1; p <= pdf.numPages; p++) {
+        const page = await pdf.getPage(p);
+        const tc = await page.getTextContent();
+        const items = tc.items.filter(
+          (it): it is TextItem => 'str' in it && 'transform' in it,
+        );
+        let pageFull = '';
+        for (const it of items) {
+          pageFull += it.str;
+          if ((it as TextItem & { hasEOL?: boolean }).hasEOL) pageFull += '\n';
+          else pageFull += ' ';
+        }
+        pages.push({ pageNumber: p, length: pageFull.length, globalStart: global.length });
+        global += pageFull;
+        // Page separator — a newline is whitespace, so normalize() collapses
+        // it, but it still prevents characters from bleeding across pages
+        // into a false cross-page match.
+        global += '\n';
+      }
+      if (cancelled) return;
+      const globalRanges = findAllChunkRanges(global, chunkTexts);
+      const map = new Map<number, [number, number][]>();
+      for (const [s, e] of globalRanges) {
+        for (const pg of pages) {
+          const ps = pg.globalStart;
+          const pe = ps + pg.length;
+          if (e <= ps || s >= pe) continue;
+          const ls = Math.max(0, s - ps);
+          const le = Math.min(pg.length, e - ps);
+          const arr = map.get(pg.pageNumber) ?? [];
+          arr.push([ls, le]);
+          map.set(pg.pageNumber, arr);
+        }
+      }
+      if (!cancelled) setPageRanges(map);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [pdf, chunkTexts]);
+
   if (!pdf) {
     return (
       <div className="flex h-full items-center justify-center text-text-400">
@@ -472,8 +533,9 @@ function PdfViewer({
           key={p}
           pdf={pdf}
           pageNumber={p}
-          chunkTexts={chunkTexts}
+          ranges={pageRanges.get(p) ?? []}
           cssWidth={cssWidth}
+          scrolledRef={scrolledRef}
         />
       ))}
     </div>
@@ -483,13 +545,16 @@ function PdfViewer({
 function PdfPage({
   pdf,
   pageNumber,
-  chunkTexts,
+  ranges,
   cssWidth,
+  scrolledRef,
 }: {
   pdf: PDFDocumentProxy;
   pageNumber: number;
-  chunkTexts: string[];
+  // Page-local ranges precomputed by PdfViewer against the whole document.
+  ranges: [number, number][];
   cssWidth: number;
+  scrolledRef: React.MutableRefObject<boolean>;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -551,7 +616,6 @@ function PdfPage({
         }
       }
 
-      const ranges = findAllChunkRanges(full, chunkTexts);
       const layer = layerRef.current!;
       layer.innerHTML = '';
       if (ranges.length === 0) return;
@@ -584,18 +648,24 @@ function PdfPage({
         }
       }
 
-      const first = layer.querySelector<HTMLDivElement>('div');
-      if (first) {
-        window.setTimeout(
-          () => first.scrollIntoView({ behavior: 'smooth', block: 'center' }),
-          60,
-        );
+      // Only the first page with highlights should auto-scroll. Pages render
+      // asynchronously and out of order, so whichever page finishes last
+      // would otherwise "win" the scroll — usually the wrong one.
+      if (!scrolledRef.current) {
+        const first = layer.querySelector<HTMLDivElement>('div');
+        if (first) {
+          scrolledRef.current = true;
+          window.setTimeout(
+            () => first.scrollIntoView({ behavior: 'smooth', block: 'center' }),
+            60,
+          );
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [pdf, pageNumber, chunkTexts, cssWidth]);
+  }, [pdf, pageNumber, ranges, cssWidth, scrolledRef]);
 
   return (
     <div
