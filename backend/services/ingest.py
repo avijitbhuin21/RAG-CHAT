@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import os
 import tempfile
@@ -26,11 +27,13 @@ def _prefix(task: str, file_id: UUID, filename: str | None = None) -> str:
     return f"[{task} {tag}]"
 
 _semaphore: asyncio.Semaphore | None = None
-# Serializes Docling invocations (both OCR and no-OCR) across the whole
-# process. Docling's peak RSS is ~1.5–2 GB while converting, so on an 8 GB
-# box we must never run two Docling conversions at once — otherwise the
-# second one tips us over. Text PDFs (pymupdf) don't touch this lock and
-# can still run in parallel up to INGEST_CONCURRENT_FILES.
+# Serializes Docling invocations. Only PPTX still routes through Docling
+# (with OCR, because slide content is often rasterised); every other format
+# now uses a lightweight native extractor (pymupdf / python-docx /
+# openpyxl). Docling's peak RSS is ~1.5–2 GB while converting, so two at
+# once would tip over an 8 GB box — keep the lock even though only one
+# format uses it, in case INGEST_CONCURRENT_FILES > 1 and two PPTX files
+# land in flight together.
 _docling_lock_obj: asyncio.Lock | None = None
 
 
@@ -48,47 +51,38 @@ def _docling_lock() -> asyncio.Lock:
     return _docling_lock_obj
 
 
-# Docling converters are process-global singletons. Building one allocates
-# ~1–2 GB of PyTorch weights (layout + table-structure + optionally OCR), so
-# we must NEVER construct them per-file -- the old code did, which was the
-# main OOM cause on Railway.
-_DOCLING_NO_OCR = None  # type: ignore[var-annotated]
+# Docling converter for PPTX. Building one allocates ~1.5–2 GB of PyTorch
+# weights (layout + OCR models), so we load it lazily at first PPTX ingest
+# and keep one process-global singleton. If PPTX uploads are rare this
+# stays unloaded and the container footprint remains small. Every other
+# format uses lightweight native extractors and never touches Docling.
 _DOCLING_OCR = None  # type: ignore[var-annotated]
 
 
-def _docling_converter(with_ocr: bool):
-    """Lazy singletons: no-OCR converter loaded on first text-PDF fallback,
-    OCR converter only loaded the first time we actually see a scanned PDF.
-    Most users never trigger the OCR branch at all."""
-    global _DOCLING_NO_OCR, _DOCLING_OCR
+def _docling_ocr_converter():
+    """Lazy singleton loaded on first PPTX ingest. OCR is enabled because
+    slide decks often have text rendered as images (diagrams, exported
+    screenshots) that native text extraction would miss."""
+    global _DOCLING_OCR
+    if _DOCLING_OCR is not None:
+        return _DOCLING_OCR
     from docling.datamodel.base_models import InputFormat
     from docling.datamodel.pipeline_options import PdfPipelineOptions
     from docling.document_converter import DocumentConverter, PdfFormatOption
 
-    if with_ocr:
-        if _DOCLING_OCR is None:
-            opts = PdfPipelineOptions(
-                do_ocr=True,
-                do_table_structure=False,
-                generate_page_images=False,
-            )
-            _DOCLING_OCR = DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
-            )
-            log.info("built Docling-OCR converter singleton")
-        return _DOCLING_OCR
-
-    if _DOCLING_NO_OCR is None:
-        opts = PdfPipelineOptions(
-            do_ocr=False,
-            do_table_structure=False,
-            generate_page_images=False,
-        )
-        _DOCLING_NO_OCR = DocumentConverter(
-            format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
-        )
-        log.info("built Docling-no-OCR converter singleton")
-    return _DOCLING_NO_OCR
+    opts = PdfPipelineOptions(
+        do_ocr=True,
+        do_table_structure=False,
+        generate_page_images=False,
+    )
+    _DOCLING_OCR = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)}
+    )
+    log.warning(
+        "loaded Docling-OCR singleton for PPTX (adds ~1.5-2 GB RSS, "
+        "resident for process lifetime)"
+    )
+    return _DOCLING_OCR
 
 
 # ---------- sync DB helpers (called via to_thread) ----------
@@ -153,22 +147,19 @@ def _download(s3_key: str, prefix: str) -> bytes:
     return data
 
 
-def _pymupdf_open_probe(data: bytes, prefix: str):
-    """Open a PDF via pymupdf and decide whether it's native-text or scanned.
+def _pymupdf_open(data: bytes, prefix: str):
+    """Open a PDF via pymupdf. Returns (doc, page_count) or None if the
+    file can't be opened. The caller owns `doc` and must close it.
 
-    Returns (doc, page_count) for text-native PDFs — the caller then streams
-    page slabs out of `doc` and must close it. Returns None if the PDF is
-    scanned/image-only (route to Docling-OCR) or if pymupdf can't open it.
-
-    Sampling strategy: read up to the first 8 pages to compute chars/page
-    density. We avoid extracting every page here so we don't materialize the
-    whole document's text in RAM just to decide a route."""
+    We also log chars/page over a small sample so that scanned PDFs
+    (which will produce zero extractable text and fail downstream) are
+    obvious in the logs without us having to eagerly read every page."""
     import fitz  # pymupdf
 
     try:
         doc = fitz.open(stream=data, filetype="pdf")
     except Exception as e:  # noqa: BLE001
-        log.info("%s pymupdf could not open file (%s) -- falling back", prefix, e)
+        log.info("%s pymupdf could not open file (%s)", prefix, e)
         return None
     try:
         page_count = doc.page_count
@@ -178,25 +169,98 @@ def _pymupdf_open_probe(data: bytes, prefix: str):
             total += len(doc[i].get_text("text") or "")
         avg = total / max(1, sample)
         if avg < settings.PYMUPDF_MIN_CHARS_PER_PAGE:
-            log.info(
-                "%s pymupdf sampled %.1f chars/page over %d pages -- looks scanned, routing to OCR",
+            log.warning(
+                "%s pymupdf sampled %.1f chars/page over %d of %d pages -- "
+                "looks scanned; ingest will produce zero chunks and fail",
                 prefix,
                 avg,
                 sample,
+                page_count,
             )
-            doc.close()
-            return None
-        log.info(
-            "%s pymupdf probe %.0f chars/page over %d sample pages (total %d pages) -- streaming",
-            prefix,
-            avg,
-            sample,
-            page_count,
-        )
+        else:
+            log.info(
+                "%s pymupdf probe %.0f chars/page over %d sample pages (total %d pages)",
+                prefix,
+                avg,
+                sample,
+                page_count,
+            )
         return doc, page_count
     except Exception:
         doc.close()
         raise
+
+
+def _extract_docx_markdown(data: bytes, prefix: str) -> str:
+    """Extract paragraphs + tables from a DOCX without loading Docling.
+    Images/embedded objects are ignored (no OCR)."""
+    from docx import Document  # python-docx
+
+    t0 = time.perf_counter()
+    doc = Document(io.BytesIO(data))
+    parts: list[str] = []
+    for para in doc.paragraphs:
+        txt = (para.text or "").strip()
+        if txt:
+            parts.append(txt)
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [(cell.text or "").strip() for cell in row.cells]
+            cells = [c for c in cells if c]
+            if cells:
+                parts.append(" | ".join(cells))
+    md = "\n\n".join(parts)
+    log.info(
+        "%s python-docx extracted %d chars in %.2fs",
+        prefix,
+        len(md),
+        time.perf_counter() - t0,
+    )
+    return md
+
+
+def _extract_xlsx_markdown(data: bytes, prefix: str) -> str:
+    """Extract cell values from every sheet. read_only=True streams rows
+    instead of building the full object model, which matters for big
+    spreadsheets. data_only=True resolves formula results rather than the
+    formula strings."""
+    from openpyxl import load_workbook
+
+    t0 = time.perf_counter()
+    wb = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    parts: list[str] = []
+    try:
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            parts.append(f"## {sheet_name}")
+            for row in ws.iter_rows(values_only=True):
+                cells = [str(c).strip() for c in row if c is not None and str(c).strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+    finally:
+        wb.close()
+    md = "\n\n".join(parts)
+    log.info(
+        "%s openpyxl extracted %d chars in %.2fs",
+        prefix,
+        len(md),
+        time.perf_counter() - t0,
+    )
+    return md
+
+
+def _extract_txt(data: bytes, prefix: str) -> str:
+    """Plain-text files: best-effort decode. errors='replace' keeps the
+    pipeline moving on files with stray bytes rather than failing."""
+    t0 = time.perf_counter()
+    md = data.decode("utf-8", errors="replace")
+    log.info(
+        "%s txt decoded %d chars in %.2fs",
+        prefix,
+        len(md),
+        time.perf_counter() - t0,
+    )
+    return md
 
 
 def _extract_pdf_slab(doc, start: int, end: int) -> str:
@@ -211,21 +275,22 @@ def _extract_pdf_slab(doc, start: int, end: int) -> str:
     return "\n\n".join(parts)
 
 
-def _parse_with_docling(data: bytes, filename: str, prefix: str, with_ocr: bool) -> str:
-    """Blocking -- call via asyncio.to_thread. Uses a module-level singleton
-    converter so models are loaded once per process, not once per file."""
+def _parse_pptx_with_docling(data: bytes, filename: str, prefix: str) -> str:
+    """Blocking -- call via asyncio.to_thread. PPTX is the only format that
+    still goes through Docling (with OCR enabled), because slide content is
+    frequently rendered as images rather than live text shapes. Uses a
+    module-level singleton so Docling models load at most once per process."""
     suffix = os.path.splitext(filename)[1] or ""
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tf:
         tf.write(data)
         tmp_path = tf.name
     try:
         log.info(
-            "%s parsing with Docling (ocr=%s, first run per-variant loads models)...",
+            "%s parsing PPTX with Docling (OCR enabled, first run loads models)...",
             prefix,
-            with_ocr,
         )
         t0 = time.perf_counter()
-        converter = _docling_converter(with_ocr=with_ocr)
+        converter = _docling_ocr_converter()
         result = converter.convert(tmp_path)
         md = result.document.export_to_markdown()
         log.info(
@@ -242,8 +307,8 @@ def _parse_with_docling(data: bytes, filename: str, prefix: str, with_ocr: bool)
             pass
 
 
-def _is_pdf(filename: str) -> bool:
-    return filename.lower().endswith(".pdf")
+def _ext(filename: str) -> str:
+    return os.path.splitext(filename)[1].lower()
 
 
 def _chunk_markdown(text: str, target_chars: int = 2000, overlap_chars: int = 200) -> list[str]:
@@ -409,85 +474,74 @@ async def _do_ingest(file_id: UUID, filename: str, s3_key: str, prefix: str) -> 
 
     total_chunks = 0
 
-    if _is_pdf(filename):
-        probe = await asyncio.to_thread(_pymupdf_open_probe, data, prefix)
-        if probe is not None:
-            # Text-native PDF: stream page slabs out of the already-open doc
-            # and free `data` immediately — fitz copies the bytes on open, so
-            # the original buffer is no longer needed.
-            doc, page_count = probe
-            del data
-            try:
-                for start_page in range(0, page_count, PDF_STREAM_PAGE_SLAB):
-                    end_page = min(start_page + PDF_STREAM_PAGE_SLAB, page_count)
-                    t_slab = time.perf_counter()
-                    slab = await asyncio.to_thread(
-                        _extract_pdf_slab, doc, start_page, end_page
-                    )
-                    log.info(
-                        "%s slab pages %d-%d extracted in %.2fs (%d chars)",
-                        prefix,
-                        start_page + 1,
-                        end_page,
-                        time.perf_counter() - t_slab,
-                        len(slab),
-                    )
-                    produced = await _process_markdown_slab(
-                        file_id, filename, prefix, slab, total_chunks
-                    )
-                    total_chunks += produced
-                    del slab
-                    # Publish incremental progress. stage_total grows as we
-                    # go; the UI just reflects whatever the latest snapshot
-                    # says, which is acceptable for streaming ingest.
-                    await asyncio.to_thread(
-                        _update_status,
-                        file_id,
-                        stage_current=total_chunks,
-                        stage_total=total_chunks,
-                    )
-                    broker.publish(
-                        str(file_id),
-                        {
-                            "status": "embedding",
-                            "stage_current": total_chunks,
-                            "stage_total": total_chunks,
-                        },
-                    )
-            finally:
-                doc.close()
-        else:
-            # Scanned PDF: Docling-OCR, serialized across the process.
+    ext = _ext(filename)
+
+    if ext == ".pdf":
+        probe = await asyncio.to_thread(_pymupdf_open, data, prefix)
+        if probe is None:
+            raise RuntimeError("pymupdf could not open PDF")
+        doc, page_count = probe
+        # fitz copies the bytes on open, so the original buffer is no longer
+        # needed — free it before starting the per-slab loop.
+        del data
+        try:
+            for start_page in range(0, page_count, PDF_STREAM_PAGE_SLAB):
+                end_page = min(start_page + PDF_STREAM_PAGE_SLAB, page_count)
+                t_slab = time.perf_counter()
+                slab = await asyncio.to_thread(
+                    _extract_pdf_slab, doc, start_page, end_page
+                )
+                log.info(
+                    "%s slab pages %d-%d extracted in %.2fs (%d chars)",
+                    prefix,
+                    start_page + 1,
+                    end_page,
+                    time.perf_counter() - t_slab,
+                    len(slab),
+                )
+                produced = await _process_markdown_slab(
+                    file_id, filename, prefix, slab, total_chunks
+                )
+                total_chunks += produced
+                del slab
+                # Publish incremental progress. stage_total grows as we go;
+                # the UI just reflects whatever the latest snapshot says.
+                await asyncio.to_thread(
+                    _update_status,
+                    file_id,
+                    stage_current=total_chunks,
+                    stage_total=total_chunks,
+                )
+                broker.publish(
+                    str(file_id),
+                    {
+                        "status": "embedding",
+                        "stage_current": total_chunks,
+                        "stage_total": total_chunks,
+                    },
+                )
+        finally:
+            doc.close()
+    else:
+        # Non-PDF: dispatch to the right extractor. DOCX/XLSX/TXT use
+        # lightweight native libraries (no Docling, no OCR, low RAM).
+        # PPTX still goes through Docling-with-OCR because slides often
+        # have text rendered as images that native parsers would miss.
+        if ext == ".docx":
+            md = await asyncio.to_thread(_extract_docx_markdown, data, prefix)
+        elif ext == ".xlsx":
+            md = await asyncio.to_thread(_extract_xlsx_markdown, data, prefix)
+        elif ext in (".txt", ".md"):
+            md = await asyncio.to_thread(_extract_txt, data, prefix)
+        elif ext == ".pptx":
             async with _docling_lock():
                 md = await asyncio.to_thread(
-                    _parse_with_docling, data, filename, prefix, True
+                    _parse_pptx_with_docling, data, filename, prefix
                 )
-            del data
-            total_chunks = await _process_markdown_slab(
-                file_id, filename, prefix, md, 0
-            )
-            del md
-            await asyncio.to_thread(
-                _update_status,
-                file_id,
-                stage_current=total_chunks,
-                stage_total=total_chunks,
-            )
-            broker.publish(
-                str(file_id),
-                {
-                    "status": "embedding",
-                    "stage_current": total_chunks,
-                    "stage_total": total_chunks,
-                },
-            )
-    else:
-        # Non-PDF (docx/pptx/xlsx/txt): Docling no-OCR, serialized.
-        async with _docling_lock():
-            md = await asyncio.to_thread(
-                _parse_with_docling, data, filename, prefix, False
-            )
+        else:
+            raise RuntimeError(f"unsupported file extension: {ext or '(none)'}")
         del data
+
         total_chunks = await _process_markdown_slab(
             file_id, filename, prefix, md, 0
         )

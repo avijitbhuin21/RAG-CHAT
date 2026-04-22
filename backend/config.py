@@ -77,8 +77,10 @@ class Settings(BaseSettings):
     INGEST_CONCURRENT_FILES: int = 2
 
     # Fast path: if pymupdf pulls at least this many chars per page from a
-    # PDF, treat it as a native-text PDF and skip Docling entirely. Scanned
-    # PDFs fall below this and get routed through Docling-with-OCR.
+    # PDF, treat it as a native-text PDF. Scanned PDFs fall below this
+    # threshold; with no OCR fallback they produce zero extractable text
+    # and the ingest will fail cleanly with "document produced zero
+    # chunks" rather than crashing the container.
     PYMUPDF_MIN_CHARS_PER_PAGE: int = 50
 
     @property
