@@ -196,7 +196,7 @@ export function SourcePanel({
   return (
     <aside
       ref={panelRef}
-      className="pointer-events-auto fixed right-0 top-0 z-50 flex h-[100dvh] w-full flex-col border-l border-border bg-bg-0 shadow-2xl animate-slide-in-right sm:max-w-[640px]"
+      className="theme-light pointer-events-auto fixed right-0 top-0 z-50 flex h-[100dvh] w-full flex-col border-l border-border bg-white shadow-2xl animate-slide-in-right sm:max-w-[640px]"
     >
       <header className="flex items-center gap-2 border-b border-border bg-bg-100 px-4 py-3">
         <FileText className="h-4 w-4 shrink-0 text-accent" />
@@ -216,7 +216,7 @@ export function SourcePanel({
         </button>
       </header>
 
-      <div className="flex-1 overflow-y-auto bg-bg-0">
+      <div className="flex-1 overflow-y-auto bg-white">
         {loading && (
           <div className="flex h-full items-center justify-center text-text-400">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading document…

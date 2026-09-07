@@ -5,7 +5,7 @@ from sqlalchemy import text
 
 from . import models  # noqa: F401  — register tables on Base.metadata
 from .db import Base, engine
-from .services import bifrost, qdrant, s3
+from .services import openrouter, qdrant, s3
 
 log = logging.getLogger("startup")
 
@@ -29,9 +29,9 @@ async def _check_s3() -> None:
     log.info("s3 OK")
 
 
-async def _check_bifrost() -> None:
-    await bifrost.health()
-    log.info("bifrost OK")
+async def _check_openrouter() -> None:
+    await openrouter.health()
+    log.info("openrouter OK")
 
 
 def _init_schema() -> None:
@@ -52,5 +52,5 @@ def _init_schema() -> None:
 async def run_startup() -> None:
     log.info("running startup checks...")
     await asyncio.to_thread(_init_schema)
-    await asyncio.gather(_check_postgres(), _check_qdrant(), _check_s3(), _check_bifrost())
+    await asyncio.gather(_check_postgres(), _check_qdrant(), _check_s3(), _check_openrouter())
     log.info("all startup checks passed")

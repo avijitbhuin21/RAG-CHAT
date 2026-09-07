@@ -31,24 +31,16 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 43200
 
-    BIFROST_BASE_URL: str
-    BIFROST_API_KEY: str
-    BIFROST_LLM_MODEL: str = "claude-sonnet-4-6"
-    BIFROST_EMBEDDING_MODEL: str = "gemini-embedding-001"
-    BIFROST_ANTHROPIC_BETA: str = "context-1m-2025-08-07"
-    # Anthropic-native endpoint on Bifrost. Docs: point the Anthropic SDK
-    # at `{host}/anthropic` (SDK appends `/v1/messages` internally). Leave
-    # blank to auto-derive from BIFROST_BASE_URL by stripping the OpenAI-
-    # compat `/v1` suffix.
-    BIFROST_ANTHROPIC_BASE_URL: str = ""
+    OPENROUTER_API_KEY: str
+    OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    OPENROUTER_LLM_MODEL: str = "z-ai/glm-5.3-flash"
+    OPENROUTER_EMBEDDING_MODEL: str = "google/gemini-embedding-001"
+    # OpenRouter `reasoning.effort`. GLM 5.3 Flash emits zero reasoning tokens
+    # below `max`; keep `max` if the thinking panel should show anything.
+    LLM_REASONING_EFFORT: str = "max"
 
     EMBEDDING_DIM: int = 1536
-    THINKING_BUDGET_TOKENS: int = 5000
-    # Sonnet 4.6's standard output cap is 64k tokens. Anthropic's API requires
-    # max_tokens to be set explicitly; when we don't pass it, Bifrost's
-    # OpenAI→Anthropic translator picks an unsafe small default (~8) that
-    # silently truncates long answers.
-    LLM_MAX_OUTPUT_TOKENS: int = 64000
+    LLM_MAX_OUTPUT_TOKENS: int = 32000
     CHAT_HISTORY_MAX_MESSAGES: int = 40
     CHAT_RATE_LIMIT_PER_HOUR: int = 100
 
@@ -67,7 +59,7 @@ class Settings(BaseSettings):
     S3_PREFIX_ORIGINALS: str = "originals/"
     S3_PREFIX_PAGE_RENDERS: str = "page-renders/"
 
-    # Verified ceilings from scripts/test_bifrost_embeddings.py at 75% safety margin.
+    # Verified ceilings from scripts/test_openrouter_embeddings.py at 75% safety margin.
     EMBED_MAX_BATCH_ITEMS: int = 75
     EMBED_MAX_BATCH_TOKENS: int = 22500
     EMBED_MAX_TOKENS_PER_TEXT: int = 4500
@@ -86,29 +78,6 @@ class Settings(BaseSettings):
     @property
     def cors_origins(self) -> list[str]:
         return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
-
-    @property
-    def bifrost_anthropic_base_url(self) -> str:
-        """Resolve the Anthropic-native base URL on Bifrost.
-
-        Bifrost segregates provider paths: OpenAI-compat lives under
-        `/openai/v1/...` and Anthropic-native under `/anthropic/v1/...`.
-        We derive the Anthropic base by stripping any `/openai` / `/v1`
-        tail from BIFROST_BASE_URL and appending `/anthropic`. The
-        Anthropic SDK then appends `/v1/messages` itself.
-
-        Set BIFROST_ANTHROPIC_BASE_URL explicitly to override.
-        """
-        if self.BIFROST_ANTHROPIC_BASE_URL:
-            return self.BIFROST_ANTHROPIC_BASE_URL.rstrip("/")
-        base = self.BIFROST_BASE_URL.rstrip("/")
-        for suffix in ("/v1", "/openai", "/openai/v1"):
-            if base.endswith(suffix):
-                base = base[: -len(suffix)]
-        # Second pass in case /openai/v1 was trimmed to /openai.
-        if base.endswith("/openai"):
-            base = base[: -len("/openai")]
-        return f"{base}/anthropic"
 
 
 settings = Settings()

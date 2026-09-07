@@ -1,34 +1,29 @@
-"""Chat orchestration using Bifrost's native Anthropic endpoint.
+"""Chat orchestration on OpenRouter via the OpenAI chat-completions API.
 
-We deliberately avoid the OpenAI-compat path here — Bifrost's translator
-silently drops the post-tool-result follow-up response (returns 0 chars),
-and doesn't forward thinking blocks. The Anthropic-native endpoint at
-`{BIFROST_BASE_URL}/anthropic` accepts the Anthropic Python SDK as a
-drop-in replacement and handles tool use + extended thinking correctly.
+Round 1 lets the model decide whether to call `search_knowledge_base`
+(reasoning on, non-streaming). If it does, the searches run in-process and
+Round 2 is a fresh streamed synthesis with the excerpts embedded in the user
+turn, which yields reliable [n] citations without replaying tool protocol.
 """
 import asyncio
+import json
 import logging
 import time
 from typing import AsyncIterator
-from uuid import UUID
+from uuid import UUID, uuid4
 
-import anthropic
 import httpx
+import openai
 
 from ..config import settings
 from ..db import SessionLocal
 from ..models import Chat, Message
-from . import bifrost
+from . import openrouter
 from . import qdrant as qdrant_svc
 
 log = logging.getLogger("task.chat")
 
 
-# Transient errors that indicate the upstream connection or server hiccuped
-# mid-call — safe to retry with the same inputs. `RemoteProtocolError` is the
-# chunked-encoding framing bug we saw on Bifrost mid-stream; the rest cover
-# the usual network / 5xx family. Anything else (4xx, auth, validation) is
-# our fault and shouldn't be retried.
 _TRANSIENT_EXC: tuple[type[BaseException], ...] = (
     httpx.RemoteProtocolError,
     httpx.ReadError,
@@ -38,13 +33,14 @@ _TRANSIENT_EXC: tuple[type[BaseException], ...] = (
     httpx.ReadTimeout,
     httpx.WriteTimeout,
     httpx.PoolTimeout,
-    anthropic.APIConnectionError,
-    anthropic.APITimeoutError,
-    anthropic.InternalServerError,
+    openai.APIConnectionError,
+    openai.APITimeoutError,
+    openai.InternalServerError,
+    openai.RateLimitError,
     asyncio.TimeoutError,
 )
 
-MAX_LLM_ATTEMPTS = 3  # 1 initial try + 2 retries
+MAX_LLM_ATTEMPTS = 3
 
 
 def _prefix(chat_id: UUID, user_email: str | None) -> str:
@@ -53,7 +49,10 @@ def _prefix(chat_id: UUID, user_email: str | None) -> str:
     return f"[chat {tag} {who}]"
 
 
-SYSTEM_PROMPT = """You are a helpful assistant for the 1staid4sme knowledge base.
+SYSTEM_PROMPT = """You are the 1staid4sme assistant — the official chatbot for the 1staid4sme (First Aid for SME) knowledge base.
+
+## Identity
+Whenever the user asks who you are, what you are, which chatbot/assistant this is, or who built you, always answer that you are the 1staid4sme assistant (First Aid for SME chatbot) that helps with questions about the 1staid4sme knowledge base. Never describe yourself as a generic AI model or name the underlying model or provider.
 
 ## When to use the search_knowledge_base tool
 ONLY call `search_knowledge_base` when the user is asking a substantive question whose answer would come from internal company documents (policies, procedures, products, customers, internal data).
@@ -83,30 +82,47 @@ Format answers in GitHub-flavored Markdown (**bold**, bullet lists, fenced code 
 """
 
 
-# Anthropic-native tool schema (flat, uses `input_schema`, not OpenAI's
-# nested `function.parameters` shape).
 SEARCH_TOOL = {
-    "name": "search_knowledge_base",
-    "description": (
-        "Search the 1staid4sme knowledge base for excerpts relevant to the "
-        "user's question. Use this whenever the answer depends on company-"
-        "specific information stored in our internal documents. Skip for "
-        "small talk, meta questions, or generic knowledge."
-    ),
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": (
-                    "A focused search query paraphrased from the user's "
-                    "question. Use the language of the documents."
-                ),
-            }
+    "type": "function",
+    "function": {
+        "name": "search_knowledge_base",
+        "description": (
+            "Search the 1staid4sme knowledge base for excerpts relevant to the "
+            "user's question. Use this whenever the answer depends on company-"
+            "specific information stored in our internal documents. Skip for "
+            "small talk, meta questions, or generic knowledge."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": (
+                        "A focused search query paraphrased from the user's "
+                        "question. Use the language of the documents."
+                    ),
+                }
+            },
+            "required": ["query"],
         },
-        "required": ["query"],
     },
 }
+
+
+def _reasoning_body() -> dict:
+    """Build the OpenRouter-specific request extensions (reasoning + provider routing)."""
+    return {
+        "reasoning": {"enabled": True, "effort": settings.LLM_REASONING_EFFORT},
+        "provider": {"sort": "latency"},
+    }
+
+
+def _extra_str(obj, key: str) -> str:
+    """Read a non-standard string field (e.g. OpenRouter's `reasoning`) off an SDK model."""
+    val = getattr(obj, key, None)
+    if val is None and getattr(obj, "model_extra", None):
+        val = obj.model_extra.get(key)
+    return val if isinstance(val, str) else ""
 
 
 def _group_hits_by_file(hits: list[dict]) -> list[dict]:
@@ -143,8 +159,7 @@ def _format_excerpts(grouped: list[dict]) -> str:
 
 
 async def _retrieve(query: str, top_k: int = 6) -> list[dict]:
-    vectors = await bifrost.embed_texts([query])
-    # Over-fetch so dedup by content still leaves us with ~top_k unique hits.
+    vectors = await openrouter.embed_texts([query])
     resp = await qdrant_svc.client().query_points(
         collection_name=settings.QDRANT_COLLECTION,
         query=vectors[0],
@@ -154,12 +169,6 @@ async def _retrieve(query: str, top_k: int = 6) -> list[dict]:
     out: list[dict] = []
     for p in resp.points:
         text = (p.payload.get("chunk_text") or "").strip()
-        # Dedup by a normalized whitespace-collapsed key so that the same
-        # document uploaded twice (different file_id, identical chunk text)
-        # doesn't consume multiple slots in the prompt. Without this the
-        # model sees 3 pairs of duplicates, concludes "insufficient info",
-        # and tries to call the tool again on R2 — producing "Let me search
-        # for more..." instead of a real answer.
         key = " ".join(text.split())
         if not key or key in seen:
             continue
@@ -178,18 +187,21 @@ async def _retrieve(query: str, top_k: int = 6) -> list[dict]:
     return out
 
 
-def _load_history(chat_id: UUID, limit: int) -> list[dict]:
+def _load_history_authz(chat_id: UUID, user_id: UUID, limit: int) -> list[dict] | None:
+    """One round-trip: return trailing history for the chat, or None if the chat
+    doesn't exist / isn't owned by user_id."""
     db = SessionLocal()
     try:
-        msgs = (
-            db.query(Message)
-            .filter(Message.chat_id == chat_id)
+        rows = (
+            db.query(Chat.id, Message)
+            .outerjoin(Message, Message.chat_id == Chat.id)
+            .filter(Chat.id == chat_id, Chat.user_id == user_id)
             .order_by(Message.created_at.asc())
             .all()
         )
-        # Anthropic accepts either a string or a list of content blocks;
-        # stored history is plain text from previous final answers, so
-        # string content is correct and simplest here.
+        if not rows:
+            return None
+        msgs = [m for _, m in rows if m is not None]
         return [{"role": m.role, "content": m.content} for m in msgs[-limit:]]
     finally:
         db.close()
@@ -205,24 +217,26 @@ def _save_user_message(chat_id: UUID, content: str) -> None:
 
 
 def _save_assistant_message(
+    msg_id: UUID,
     chat_id: UUID,
     content: str,
     thinking: str | None,
     citations: list,
     tool_calls: list,
-) -> UUID:
+) -> None:
     db = SessionLocal()
     try:
-        msg = Message(
-            chat_id=chat_id,
-            role="assistant",
-            content=content,
-            thinking=thinking,
-            citations=citations,
-            tool_calls=tool_calls,
+        db.add(
+            Message(
+                id=msg_id,
+                chat_id=chat_id,
+                role="assistant",
+                content=content,
+                thinking=thinking,
+                citations=citations,
+                tool_calls=tool_calls,
+            )
         )
-        db.add(msg)
-        db.flush()
         chat = db.get(Chat, chat_id)
         if chat and chat.title == "New chat":
             first_user = (
@@ -234,49 +248,80 @@ def _save_assistant_message(
             if first_user:
                 chat.title = (first_user.content[:60].strip()) or "New chat"
         db.commit()
-        return msg.id
     finally:
         db.close()
 
 
-def _blocks_to_dict(blocks) -> list[dict]:
-    """Convert SDK content-block models back to plain dicts so we can
-    round-trip them in the `messages` list. `model_dump(mode='json')`
-    preserves the `signature` on thinking blocks, which Anthropic requires
-    for multi-turn extended thinking to work."""
-    return [b.model_dump(mode="json", exclude_none=True) for b in blocks]
+_background_saves: set[asyncio.Task] = set()
 
 
-async def _handle_stream(stream, log_prefix: str):
-    """Drain an Anthropic messages.stream() context, yielding our SSE
-    event dicts (thinking_delta / content_delta). Returns the final
-    assembled message once the stream finishes so the caller can decide
-    what to do based on stop_reason + content blocks.
-    """
+def _track(task: asyncio.Task) -> asyncio.Task:
+    """Keep a strong ref to a fire-and-forget task until it finishes."""
+    _background_saves.add(task)
+    task.add_done_callback(_background_saves.discard)
+    return task
+
+
+def _persist_in_background(prefix: str, after: asyncio.Task | None, *args) -> None:
+    """Fire-and-forget the assistant-message save (ordered after the user-turn
+    save) so the SSE stream can close immediately."""
+
+    async def _run() -> None:
+        try:
+            if after is not None:
+                await asyncio.shield(after)
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(_save_assistant_message, *args)
+            log.info("%s assistant message persisted", prefix)
+        except Exception:
+            log.exception("%s FAILED to persist assistant message", prefix)
+
+    _track(asyncio.create_task(_run()))
+
+
+async def _handle_stream(stream, log_prefix: str, tool_acc: dict[int, dict] | None = None):
+    """Drain a chat-completions stream, yielding ("content"|"thinking", text) tuples.
+
+    When `tool_acc` is given, tool-call fragments are merged into it by index
+    and a ("tool_call", None) marker is yielded the first time one appears."""
     first_token_at: float | None = None
     t0 = time.perf_counter()
-    async for event in stream:
-        etype = getattr(event, "type", None)
-        if etype != "content_block_delta":
+    signalled_tool = False
+    async for chunk in stream:
+        if not chunk.choices:
             continue
-        delta = event.delta
-        dtype = getattr(delta, "type", None)
-        if dtype == "text_delta":
-            if first_token_at is None:
-                first_token_at = time.perf_counter()
-                log.info("%s first text token in %.2fs", log_prefix, first_token_at - t0)
-            yield ("content", delta.text)
-        elif dtype == "thinking_delta":
+        delta = chunk.choices[0].delta
+        if delta is None:
+            continue
+        reasoning = _extra_str(delta, "reasoning")
+        if reasoning:
             if first_token_at is None:
                 first_token_at = time.perf_counter()
                 log.info("%s first thinking token in %.2fs", log_prefix, first_token_at - t0)
-            yield ("thinking", delta.thinking)
-        # input_json_delta and signature_delta are captured in the final
-        # message via get_final_message(); no need to surface mid-stream.
+            yield ("thinking", reasoning)
+        if delta.content:
+            if first_token_at is None:
+                first_token_at = time.perf_counter()
+                log.info("%s first text token in %.2fs", log_prefix, first_token_at - t0)
+            yield ("content", delta.content)
+        if tool_acc is not None and delta.tool_calls:
+            for tc in delta.tool_calls:
+                slot = tool_acc.setdefault(tc.index, {"name": "", "arguments": ""})
+                if tc.function:
+                    if tc.function.name:
+                        slot["name"] = tc.function.name
+                    if tc.function.arguments:
+                        slot["arguments"] += tc.function.arguments
+            if not signalled_tool:
+                signalled_tool = True
+                yield ("tool_call", None)
 
 
 async def stream_chat(
     chat_id: UUID,
+    user_id: UUID,
     user_message: str,
     user_email: str | None = None,
 ) -> AsyncIterator[dict]:
@@ -290,61 +335,78 @@ async def stream_chat(
     )
     task_t0 = time.perf_counter()
 
-    await asyncio.to_thread(_save_user_message, chat_id, user_message)
+    yield {"type": "thinking_start"}
 
+    t_db = time.perf_counter()
     history = await asyncio.to_thread(
-        _load_history, chat_id, settings.CHAT_HISTORY_MAX_MESSAGES
+        _load_history_authz, chat_id, user_id, settings.CHAT_HISTORY_MAX_MESSAGES
     )
-    # history already includes the message we just saved (it's the last item).
-    messages: list[dict] = list(history)
+    if history is None:
+        log.warning("%s chat not found or not owned by user — aborting", prefix)
+        yield {"type": "error", "message": "chat not found"}
+        return
+    log.info("%s history loaded (%d msgs) in %.2fs", prefix, len(history), time.perf_counter() - t_db)
 
-    client = bifrost.anthropic_client()
+    async def _save_user() -> None:
+        try:
+            await asyncio.to_thread(_save_user_message, chat_id, user_message)
+        except Exception:
+            log.exception("%s FAILED to persist user message", prefix)
+
+    user_save_task = _track(asyncio.create_task(_save_user()))
+
+    messages: list[dict] = (
+        [{"role": "system", "content": SYSTEM_PROMPT}]
+        + list(history)
+        + [{"role": "user", "content": user_message}]
+    )
+
+    client = openrouter.llm_client()
 
     content_buf: list[str] = []
     thinking_buf: list[str] = []
     citations: list = []
     tool_calls: list[dict] = []
 
-    yield {"type": "thinking_start"}
-
-    # ---- Round 1: with tools + extended thinking ----
+    # ---- Round 1: streamed tool decision / direct answer ----
     log.info(
-        "%s calling LLM round 1 | model=%s max_tokens=%d thinking_budget=%d",
+        "%s calling LLM round 1 | model=%s max_tokens=%d reasoning=%s",
         prefix,
-        settings.BIFROST_LLM_MODEL,
+        settings.OPENROUTER_LLM_MODEL,
         settings.LLM_MAX_OUTPUT_TOKENS,
-        settings.THINKING_BUDGET_TOKENS,
+        settings.LLM_REASONING_EFFORT,
     )
     t_round = time.perf_counter()
 
-    # R1 is non-streaming: we don't want to progressively render thinking or
-    # a pre-tool text preamble — the user-visible answer comes from R2. We
-    # still emit thinking/text as single chunks after R1 returns so the UI's
-    # thinking panel stays populated.
-    # Retry on transient upstream errors. R1 is blocking so no partial output
-    # needs to be rolled back — safe to just call again.
-    final_r1 = None
+    tool_acc: dict[int, dict] = {}
     for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
+        tool_acc = {}
+        content_emitted = False
         try:
-            final_r1 = await client.messages.create(
-                model=settings.BIFROST_LLM_MODEL,
+            stream1 = await client.chat.completions.create(
+                model=settings.OPENROUTER_LLM_MODEL,
                 max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
-                system=SYSTEM_PROMPT,
                 messages=messages,
                 tools=[SEARCH_TOOL],
-                thinking={
-                    "type": "enabled",
-                    "budget_tokens": settings.THINKING_BUDGET_TOKENS,
-                },
-                extra_headers={
-                    "anthropic-beta": settings.BIFROST_ANTHROPIC_BETA
-                },
-                # SDK refuses non-streaming calls whose estimated duration
-                # exceeds 10 min based on max_tokens (64k here). Pass an
-                # explicit timeout to skip that check — R1 is short in
-                # practice (thinking + a tool use block, not 64k of output).
+                stream=True,
+                extra_body=_reasoning_body(),
                 timeout=600.0,
             )
+            async for kind, payload in _handle_stream(
+                stream1, f"{prefix} R1 attempt={attempt}", tool_acc
+            ):
+                if kind == "thinking":
+                    thinking_buf.append(payload)
+                    yield {"type": "thinking_delta", "content": payload}
+                elif kind == "content" and not tool_acc:
+                    content_emitted = True
+                    content_buf.append(payload)
+                    yield {"type": "content_delta", "content": payload}
+                elif kind == "tool_call" and content_emitted:
+                    # Any pre-tool preamble the model streamed is not the
+                    # answer — the real answer comes from R2.
+                    content_buf.clear()
+                    yield {"type": "content_reset", "reason": "tool_call"}
             break
         except _TRANSIENT_EXC as e:
             if attempt == MAX_LLM_ATTEMPTS:
@@ -358,62 +420,39 @@ async def stream_chat(
                 "%s R1 transient error on attempt %d/%d: %r — retrying in %ds",
                 prefix, attempt, MAX_LLM_ATTEMPTS, e, backoff,
             )
+            content_buf.clear()
+            thinking_buf.clear()
+            yield {"type": "content_reset", "reason": "retry", "attempt": attempt}
             await asyncio.sleep(backoff)
-    assert final_r1 is not None
-    for block in final_r1.content:
-        btype = getattr(block, "type", None)
-        if btype == "thinking":
-            text = getattr(block, "thinking", "") or ""
-            if text:
-                thinking_buf.append(text)
-                yield {"type": "thinking_delta", "content": text}
-        elif btype == "text":
-            text = getattr(block, "text", "") or ""
-            if text:
-                content_buf.append(text)
-                yield {"type": "content_delta", "content": text}
 
+    r1_tool_calls = [tool_acc[i] for i in sorted(tool_acc)]
     log.info(
-        "%s round 1 done in %.2fs | stop=%s blocks=%d (%s)",
+        "%s round 1 done in %.2fs | tool_calls=%d text=%d chars thinking=%d chars",
         prefix,
         time.perf_counter() - t_round,
-        final_r1.stop_reason,
-        len(final_r1.content),
-        [b.type for b in final_r1.content],
+        len(r1_tool_calls),
+        sum(len(p) for p in content_buf),
+        sum(len(p) for p in thinking_buf),
     )
 
     # ---- Tool use + Round 2 ----
-    if final_r1.stop_reason == "tool_use":
-        # We intentionally do NOT replay R1's assistant turn + a
-        # tool_result user turn via Anthropic's tool_use protocol. That
-        # shape (the documented pattern) routinely returns `end_turn`
-        # with zero content blocks when routed through Bifrost —
-        # validated 0/5 successes in scripts/test_r2_nudge_fix.py even
-        # with dedup + text nudge workarounds.
-        #
-        # Instead: execute the requested tool(s) in-process and call R2
-        # as a FRESH synthesis with the retrieved excerpts embedded
-        # directly in the user message. Validated 5/5 successes,
-        # ~1.2k char answers with proper [n] citations.
-        # Anthropic's API allows the model to emit multiple tool_use blocks
-        # in a single turn (parallel tool use is on by default). Run those
-        # searches CONCURRENTLY via asyncio.gather — serialising them would
-        # block R2 on the slowest lookup and double the user-visible wait.
-        tool_blocks = [b for b in final_r1.content if b.type == "tool_use"]
-        tool_queries: list[tuple[str, str]] = []  # (name, query)
-        for idx, block in enumerate(tool_blocks):
-            raw_input = block.input if isinstance(block.input, dict) else {}
+    if r1_tool_calls:
+        tool_queries: list[tuple[str, str]] = []
+        for idx, tc in enumerate(r1_tool_calls):
+            name = tc["name"] or "search_knowledge_base"
+            try:
+                raw_input = json.loads(tc["arguments"] or "{}")
+            except ValueError:
+                raw_input = {}
+            if not isinstance(raw_input, dict):
+                raw_input = {}
             query = raw_input.get("query") or user_message
-            tool_queries.append((block.name, query))
-            tool_calls.append({"name": block.name, "query": query})
-            # Include `index` so the client can match this start with its
-            # matching tool_call_done — essential for parallel calls where
-            # the final "done" events don't necessarily arrive in start
-            # order, and marking-last would strand other entries as active.
+            tool_queries.append((name, query))
+            tool_calls.append({"name": name, "query": query})
             yield {
                 "type": "tool_call_start",
                 "index": idx,
-                "name": block.name,
+                "name": name,
                 "query": query,
             }
 
@@ -438,9 +477,6 @@ async def stream_chat(
                 "hit_count": len(hits),
             }
 
-        # One citation per source file (not per chunk). The frontend uses
-        # chunk_texts[] to highlight every cited passage inside the opened
-        # document via normalized text search.
         grouped = _group_hits_by_file(all_hits)
         for i, entry in enumerate(grouped, 1):
             citations.append(
@@ -453,10 +489,6 @@ async def stream_chat(
             )
         yield {"type": "citations", "citations": citations}
 
-        # Build R2 messages: prior conversation history (without the
-        # current user turn) + a single composite user message carrying
-        # both the question AND the retrieved excerpts. `messages` has
-        # the current user turn as its LAST element — we replace it.
         composite = (
             f"{user_message}\n\n"
             "Here are relevant excerpts retrieved from the knowledge base, "
@@ -476,36 +508,31 @@ async def stream_chat(
             prefix,
             len(all_hits),
         )
-        # Snapshot buffer lengths so a mid-stream retry only rolls back R2's
-        # output, not anything already committed from R1 / tool emission.
         r2_content_start = len(content_buf)
         r2_thinking_start = len(thinking_buf)
 
-        final_r2 = None
         t_round2 = time.perf_counter()
         for attempt in range(1, MAX_LLM_ATTEMPTS + 1):
             try:
-                async with client.messages.stream(
-                    model=settings.BIFROST_LLM_MODEL,
+                stream2 = await client.chat.completions.create(
+                    model=settings.OPENROUTER_LLM_MODEL,
                     max_tokens=settings.LLM_MAX_OUTPUT_TOKENS,
-                    system=SYSTEM_PROMPT,
                     messages=r2_messages,
-                ) as stream2:
-                    async for kind, payload in _handle_stream(
-                        stream2, f"{prefix} R2 attempt={attempt}"
-                    ):
-                        if kind == "content":
-                            content_buf.append(payload)
-                            yield {"type": "content_delta", "content": payload}
-                        elif kind == "thinking":
-                            thinking_buf.append(payload)
-                            yield {"type": "thinking_delta", "content": payload}
-                    final_r2 = await stream2.get_final_message()
+                    stream=True,
+                    extra_body=_reasoning_body(),
+                    timeout=600.0,
+                )
+                async for kind, payload in _handle_stream(
+                    stream2, f"{prefix} R2 attempt={attempt}"
+                ):
+                    if kind == "content":
+                        content_buf.append(payload)
+                        yield {"type": "content_delta", "content": payload}
+                    elif kind == "thinking":
+                        thinking_buf.append(payload)
+                        yield {"type": "thinking_delta", "content": payload}
                 break
             except _TRANSIENT_EXC as e:
-                # Record how much we streamed before the failure so we can
-                # decide whether to retry (almost always yes) and so logs
-                # show the user-visible impact.
                 partial_chars = sum(
                     len(p) for p in content_buf[r2_content_start:]
                 )
@@ -522,20 +549,15 @@ async def stream_chat(
                     "— retrying in %ds",
                     prefix, attempt, MAX_LLM_ATTEMPTS, partial_chars, e, backoff,
                 )
-                # Discard the partial R2 output in our buffers AND tell the
-                # client to clear what it already rendered so the retried
-                # answer doesn't stack on top of the aborted one.
                 del content_buf[r2_content_start:]
                 del thinking_buf[r2_thinking_start:]
                 yield {"type": "content_reset", "reason": "retry", "attempt": attempt}
                 await asyncio.sleep(backoff)
-        assert final_r2 is not None
         log.info(
-            "%s round 2 done in %.2fs | stop=%s blocks=%d",
+            "%s round 2 done in %.2fs | content=%d chars",
             prefix,
             time.perf_counter() - t_round2,
-            final_r2.stop_reason,
-            len(final_r2.content),
+            sum(len(p) for p in content_buf[r2_content_start:]),
         )
 
     content_s = "".join(content_buf)
@@ -548,17 +570,13 @@ async def stream_chat(
         len(citations),
     )
 
-    msg_id = await asyncio.to_thread(
-        _save_assistant_message,
-        chat_id,
-        content_s,
-        thinking_s,
-        citations,
-        tool_calls,
-    )
+    msg_id = uuid4()
+    yield {"type": "done", "message_id": str(msg_id)}
     log.info(
-        "%s ====== done in %.2fs ======",
+        "%s ====== stream done in %.2fs (persisting in background) ======",
         prefix,
         time.perf_counter() - task_t0,
     )
-    yield {"type": "done", "message_id": str(msg_id)}
+    _persist_in_background(
+        prefix, user_save_task, msg_id, chat_id, content_s, thinking_s, citations, tool_calls
+    )

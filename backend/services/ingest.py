@@ -13,7 +13,7 @@ from ..config import settings
 from ..db import SessionLocal
 from ..models import Chunk, FileRecord
 from ..progress_broker import broker
-from . import bifrost, qdrant, s3
+from . import openrouter, qdrant, s3
 
 log = logging.getLogger("task.ingest")
 
@@ -414,7 +414,7 @@ async def _process_markdown_slab(
             len(batch),
         )
         t_embed = time.perf_counter()
-        vectors = await bifrost.embed_texts(batch)
+        vectors = await openrouter.embed_texts(batch)
         log.info(
             "%s  embed done in %.2fs -- upserting to Qdrant",
             prefix,

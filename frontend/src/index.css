@@ -66,6 +66,31 @@
     color: hsl(var(--foreground));
   }
 
+  /* Light scope nested inside .theme-dark — used for surfaces that must stay
+     solid and readable (e.g. the source-document panel). */
+  .theme-light {
+    --background: 0 0% 100%;
+    --foreground: 200 22% 12%;
+    --muted: 195 30% 96%;
+    --muted-foreground: 200 12% 42%;
+    --border: 195 32% 88%;
+    --primary: 195 85% 41%;
+    --primary-foreground: 0 0% 100%;
+    --bg-0: #FFFFFF;
+    --bg-100: #FFFFFF;
+    --bg-200: #F0F7FA;
+    --bg-300: #D7E5EC;
+    --text-100: #0F1F28;
+    --text-200: #1F3540;
+    --text-300: #45636F;
+    --text-400: #6B8591;
+    --text-500: #8DA6B1;
+    --accent: #0EA5E9;
+    --accent-hover: #0284C7;
+    --accent-foreground: #FFFFFF;
+    color: hsl(var(--foreground));
+  }
+
   body {
     @apply bg-background text-foreground antialiased;
     font-family: 'Source Serif 4', Georgia, serif;

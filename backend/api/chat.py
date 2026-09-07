@@ -99,24 +99,11 @@ async def send_message(
         len(body.content),
     )
 
-    def _authz() -> bool:
-        db = SessionLocal()
-        try:
-            return (
-                db.query(Chat).filter_by(id=chat_id, user_id=uid).one_or_none()
-                is not None
-            )
-        finally:
-            db.close()
-
-    if not await asyncio.to_thread(_authz):
-        raise HTTPException(status_code=404, detail="chat not found")
-
     async def stream():
         thinking_chars = 0
         content_chars = 0
         try:
-            async for event in stream_chat(chat_id, body.content, user_email):
+            async for event in stream_chat(chat_id, uid, body.content, user_email):
                 etype = event.get("type")
                 if etype == "thinking_delta":
                     thinking_chars += len(event.get("content", ""))
