@@ -71,8 +71,10 @@ class MessageOut(BaseModel):
     thinking: str | None
     citations: list | None
     tool_calls: list | None = None
+    attachments: list | None = None
     created_at: datetime
 
 
 class SendMessageRequest(BaseModel):
-    content: str
+    content: str = ""
+    attachment_ids: list[str] = []

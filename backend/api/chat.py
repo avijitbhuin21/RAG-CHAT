@@ -3,7 +3,7 @@ import json
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
 from sqlalchemy.orm import Session
 
@@ -12,6 +12,7 @@ from ..db import SessionLocal, get_db
 from ..models import Chat, FileRecord, Message
 from ..schemas import ChatOut, MessageOut, SendMessageRequest
 from ..security import require_user, user_id_from_claims
+from ..services import attachments as attachments_svc
 from ..services import s3 as s3_svc
 from ..services.chat_service import stream_chat
 
@@ -24,6 +25,42 @@ _QUIET_EVENT_TYPES = {"thinking_delta", "content_delta"}
 # Module-load banner so we can confirm uvicorn reload picked up the new file.
 log.info("api.chat router module loaded")
 print(">>> api/chat.py module loaded", flush=True)
+
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-transform",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+}
+_KEEPALIVE_SECONDS = 8.0
+
+
+async def _with_keepalive(gen, interval: float = _KEEPALIVE_SECONDS):
+    """Relay SSE frames from `gen`, inserting comment pings whenever it is idle for `interval` seconds."""
+    queue: asyncio.Queue = asyncio.Queue()
+    sentinel = object()
+
+    async def pump() -> None:
+        try:
+            async for item in gen:
+                await queue.put(item)
+        finally:
+            await queue.put(sentinel)
+
+    task = asyncio.create_task(pump())
+    try:
+        yield ": open\n\n"
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if item is sentinel:
+                break
+            yield item
+    finally:
+        if not task.done():
+            task.cancel()
 
 
 @router.get("/chats", response_model=list[ChatOut])
@@ -75,6 +112,42 @@ def list_messages(
     )
 
 
+@router.post("/attachments")
+async def upload_attachment(
+    file: UploadFile = File(...),
+    claims: dict = Depends(require_user),
+):
+    """Accept one chat attachment, validate/extract it and return its metadata."""
+    uid = user_id_from_claims(claims)
+    limit = max(attachments_svc.MAX_IMAGE_BYTES, attachments_svc.MAX_DOC_BYTES)
+    data = await file.read(limit + 1)
+    if len(data) > limit:
+        raise HTTPException(status_code=413, detail="File is too large (max 10 MB).")
+    try:
+        return await asyncio.to_thread(attachments_svc.store, uid, file.filename or "file", data)
+    except attachments_svc.AttachmentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+
+@router.get("/attachments/{att_id}")
+async def get_attachment(att_id: str, claims: dict = Depends(require_user)):
+    """Serve the original bytes of one of the caller's own attachments."""
+    uid = user_id_from_claims(claims)
+    try:
+        data, meta = await asyncio.to_thread(attachments_svc.load_original, uid, att_id)
+    except KeyError as e:
+        raise HTTPException(status_code=404, detail="attachment not found") from e
+    disposition = "inline" if meta.get("kind") == "image" else "attachment"
+    return Response(
+        content=data,
+        media_type=meta.get("mime") or "application/octet-stream",
+        headers={
+            "Content-Disposition": f'{disposition}; filename="{meta.get("filename", "file")}"',
+            "Cache-Control": "private, max-age=86400",
+        },
+    )
+
+
 @router.post("/chats/{chat_id}/messages")
 async def send_message(
     chat_id: UUID,
@@ -84,6 +157,18 @@ async def send_message(
     uid = user_id_from_claims(claims)
     user_email = claims.get("email")
     tag = str(chat_id)[:8]
+
+    if not body.content.strip() and not body.attachment_ids:
+        raise HTTPException(status_code=400, detail="message is empty")
+    try:
+        att_metas = await asyncio.gather(
+            *[asyncio.to_thread(attachments_svc.load_meta, uid, a) for a in body.attachment_ids]
+        )
+        attachments_svc.validate_counts(list(att_metas))
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail="unknown attachment") from e
+    except attachments_svc.AttachmentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
 
     # print() in addition to log so we see the entry even if logging is misbehaving.
     print(
@@ -103,7 +188,7 @@ async def send_message(
         thinking_chars = 0
         content_chars = 0
         try:
-            async for event in stream_chat(chat_id, uid, body.content, user_email):
+            async for event in stream_chat(chat_id, uid, body.content, user_email, list(att_metas)):
                 etype = event.get("type")
                 if etype == "thinking_delta":
                     thinking_chars += len(event.get("content", ""))
@@ -131,7 +216,9 @@ async def send_message(
                 content_chars,
             )
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _with_keepalive(stream()), media_type="text/event-stream", headers=SSE_HEADERS
+    )
 
 
 @router.get("/files/{file_id}")

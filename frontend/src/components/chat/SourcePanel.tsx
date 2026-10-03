@@ -12,6 +12,8 @@ import type { PDFDocumentProxy, TextItem } from 'pdfjs-dist/types/src/display/ap
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import mammoth from 'mammoth';
 import { API_BASE } from '@/lib/apiBase';
+import { MORPH } from '@/lib/motion';
+import { AnimatePresence, motion } from 'motion/react';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -138,27 +140,15 @@ export function SourcePanel({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const panelRef = useRef<HTMLElement>(null);
+  const isDesktop = useIsDesktop();
 
-  // Close on mousedown anywhere outside the panel. Using mousedown (not click)
-  // means opening a *different* citation still works: the citation's click
-  // handler sets a new target in the same tick React closes + reopens in one
-  // render, so there's no flicker. Also close on Escape for keyboard users.
   useEffect(() => {
     if (!target) return;
-    function onDocMouseDown(e: MouseEvent) {
-      if (!panelRef.current) return;
-      if (e.target instanceof Node && panelRef.current.contains(e.target)) return;
-      onClose();
-    }
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') onClose();
     }
-    document.addEventListener('mousedown', onDocMouseDown);
     document.addEventListener('keydown', onKey);
-    return () => {
-      document.removeEventListener('mousedown', onDocMouseDown);
-      document.removeEventListener('keydown', onKey);
-    };
+    return () => document.removeEventListener('keydown', onKey);
   }, [target, onClose]);
 
   useEffect(() => {
@@ -189,41 +179,49 @@ export function SourcePanel({
     return () => ac.abort();
   }, [target?.fileId]);
 
-  if (!target) return null;
-
-  const kind = kindOf(target.filename);
+  const kind = target ? kindOf(target.filename) : 'unknown';
 
   return (
-    <aside
-      ref={panelRef}
-      className="theme-light pointer-events-auto fixed right-0 top-0 z-50 flex h-[100dvh] w-full flex-col border-l border-border bg-white shadow-2xl animate-slide-in-right sm:max-w-[640px]"
-    >
-      <header className="flex items-center gap-2 border-b border-border bg-bg-100 px-4 py-3">
-        <FileText className="h-4 w-4 shrink-0 text-accent" />
+    <AnimatePresence>
+      {target && (
+        <motion.aside
+          key="source-panel"
+          ref={panelRef}
+          initial={isDesktop ? { width: 0, opacity: 0 } : { x: '100%', opacity: 1 }}
+          animate={isDesktop ? { width: PANEL_WIDTH, opacity: 1 } : { x: 0, opacity: 1 }}
+          exit={isDesktop ? { width: 0, opacity: 0 } : { x: '100%', opacity: 1 }}
+          transition={MORPH}
+          className="fixed inset-0 z-50 flex shrink-0 flex-col overflow-hidden bg-bg-100 lg:static lg:inset-auto lg:z-auto lg:h-full lg:rounded-[20px] lg:border lg:border-border lg:shadow-[0_10px_30px_-14px_rgba(70,55,25,0.16)]"
+        >
+          <div className="flex h-full w-full flex-col lg:w-[480px]">
+      <header className="flex items-center gap-3 border-b border-border px-5 py-4">
+        <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-accent/10">
+          <FileText className="h-5 w-5 text-accent" />
+        </div>
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold text-text-100" title={target.filename}>
+          <div className="eyebrow">Source</div>
+          <div className="truncate font-serif text-base font-semibold text-text-100" title={target.filename}>
             {target.filename}
           </div>
-          <div className="text-xs text-text-400">Source document</div>
         </div>
         <button
           type="button"
           onClick={onClose}
           title="Close"
-          className="rounded-md p-1.5 text-text-300 transition hover:bg-bg-200 hover:text-text-100"
+          className="rounded-lg p-1.5 text-text-300 transition hover:bg-bg-200 hover:text-text-100"
         >
           <X className="h-4 w-4" />
         </button>
       </header>
 
-      <div className="flex-1 overflow-y-auto bg-white">
+      <div className="flex-1 overflow-y-auto bg-bg-100">
         {loading && (
           <div className="flex h-full items-center justify-center text-text-400">
             <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading document…
           </div>
         )}
         {error && (
-          <div className="p-6 text-sm text-red-600">Failed to load document: {error}</div>
+          <div className="p-6 text-sm text-danger">Failed to load document: {error}</div>
         )}
         {!loading && !error && blob && (
           <ViewerSwitch
@@ -234,8 +232,26 @@ export function SourcePanel({
           />
         )}
       </div>
-    </aside>
+          </div>
+        </motion.aside>
+      )}
+    </AnimatePresence>
   );
+}
+
+const PANEL_WIDTH = 480;
+
+/** Tracks whether the viewport is at the lg breakpoint or wider. */
+function useIsDesktop() {
+  const query = '(min-width: 1024px)';
+  const [match, setMatch] = useState(() => typeof window !== 'undefined' && window.matchMedia(query).matches);
+  useEffect(() => {
+    const mq = window.matchMedia(query);
+    const on = () => setMatch(mq.matches);
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
+  return match;
 }
 
 function ViewerSwitch({

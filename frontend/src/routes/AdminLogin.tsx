@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
 import { api, ApiError } from '../lib/api';
+import { InfoTip } from '../components/ui/InfoTip';
 import { useSession } from '../lib/auth';
 
 export default function AdminLogin() {
@@ -29,41 +30,39 @@ export default function AdminLogin() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-muted/40 p-6">
-      <form
-        onSubmit={submit}
-        className="w-full max-w-sm rounded-lg border border-border bg-background p-8 shadow-sm"
-      >
-        <h1 className="text-2xl font-semibold tracking-tight text-foreground">Admin sign in</h1>
-        <p className="mt-2 text-sm text-muted-foreground">
-          Enter the admin credentials to manage the knowledge base.
-        </p>
+    <main className="flex min-h-[100dvh] items-center justify-center bg-background p-6">
+      <form onSubmit={submit} className="panel w-full max-w-sm p-8">
+        <div className="text-center">
+          <img src="/logo-short.png" alt="" className="mx-auto h-16 w-16 object-contain" />
+          <div className="mt-3 font-serif text-2xl font-semibold tracking-tight text-accent">1stAId4SME</div>
+          <div className="eyebrow mt-1">Knowledge base admin</div>
+        </div>
+        <h1 className="mt-8 flex items-center gap-1.5 font-serif text-xl font-semibold text-text-100">
+          Admin sign in
+          <InfoTip side="bottom">Enter the admin credentials to manage the knowledge base.</InfoTip>
+        </h1>
 
-        <label className="mt-6 block text-xs font-medium text-muted-foreground">Username</label>
+        <label className="mt-6 block text-xs font-medium text-text-300">Username</label>
         <input
           type="text"
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           autoComplete="username"
-          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+          className="field mt-1.5"
         />
 
-        <label className="mt-4 block text-xs font-medium text-muted-foreground">Password</label>
+        <label className="mt-4 block text-xs font-medium text-text-300">Password</label>
         <input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
           autoComplete="current-password"
-          className="mt-1 w-full rounded-md border border-border bg-background px-3 py-2 text-sm text-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+          className="field mt-1.5"
         />
 
-        {err && <p className="mt-4 text-xs text-red-600">{err}</p>}
+        {err && <p className="mt-4 text-xs text-danger">{err}</p>}
 
-        <button
-          type="submit"
-          disabled={busy}
-          className="mt-6 inline-flex w-full items-center justify-center rounded-md bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition hover:opacity-90 disabled:opacity-50"
-        >
+        <button type="submit" disabled={busy} className="btn-primary mt-6 w-full py-2.5">
           {busy ? 'Signing in…' : 'Sign in'}
         </button>
       </form>

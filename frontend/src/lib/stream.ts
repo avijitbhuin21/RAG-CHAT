@@ -31,28 +31,47 @@ export async function streamSSE(
   init: RequestInit,
   onEvent: (event: any) => void,
 ): Promise<void> {
-  const res = await fetch(`${API_BASE}${path}`, { ...init, credentials: 'include' });
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    credentials: 'include',
+    headers: { Accept: 'text/event-stream', ...(init.headers ?? {}) },
+  });
   if (!res.ok || !res.body) {
     throw new Error(`stream failed: ${res.status}`);
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const parts = buf.split('\n\n');
-    buf = parts.pop() ?? '';
-    for (const part of parts) {
-      const line = part.trim();
-      if (line.startsWith('data: ')) {
-        try {
-          onEvent(JSON.parse(line.slice(6)));
-        } catch {
-          /* ignore malformed */
-        }
+
+  const dispatch = (frame: string) => {
+    const data: string[] = [];
+    for (const raw of frame.split('\n')) {
+      if (!raw || raw.startsWith(':')) continue;
+      if (raw.startsWith('data:')) data.push(raw.slice(5).replace(/^ /, ''));
+    }
+    if (data.length === 0) return;
+    try {
+      onEvent(JSON.parse(data.join('\n')));
+    } catch {
+      /* ignore malformed */
+    }
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true }).replace(/\r\n?/g, '\n');
+      let split = buf.indexOf('\n\n');
+      while (split !== -1) {
+        dispatch(buf.slice(0, split));
+        buf = buf.slice(split + 2);
+        split = buf.indexOf('\n\n');
       }
     }
+    buf += decoder.decode();
+    if (buf.trim()) dispatch(buf);
+  } finally {
+    reader.releaseLock();
   }
 }

@@ -1,5 +1,18 @@
-import { useEffect, useRef, useState } from 'react';
+import {
+  AlertCircle,
+  BookOpen,
+  CheckCircle2,
+  FileText,
+  Loader,
+  LogOut,
+  Play,
+  Trash2,
+  UploadCloud,
+} from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 
+import { InfoTip } from '../components/ui/InfoTip';
+import { ThemeToggle } from '../components/ui/ThemeToggle';
 import { api } from '../lib/api';
 import { API_BASE } from '../lib/apiBase';
 import { useSession } from '../lib/auth';
@@ -66,16 +79,85 @@ const STATUS_LABEL: Record<string, string> = {
 };
 
 const STATUS_TONE: Record<string, string> = {
-  ready: 'bg-accent text-accent-foreground',
-  failed: 'bg-red-100 text-red-700',
-  delete_failed: 'bg-red-100 text-red-700',
-  staged: 'bg-amber-100 text-amber-800',
-  queued: 'bg-muted text-muted-foreground',
-  pending_ingest: 'bg-muted text-muted-foreground',
-  parsing: 'bg-primary/10 text-primary',
-  chunking: 'bg-primary/10 text-primary',
-  embedding: 'bg-primary/10 text-primary',
+  ready: 'bg-accent/10 text-accent',
+  failed: 'bg-danger-soft text-danger',
+  delete_failed: 'bg-danger-soft text-danger',
+  staged: 'bg-warn-soft text-warn',
+  queued: 'bg-bg-200 text-text-300',
+  pending_ingest: 'bg-bg-200 text-text-300',
+  parsing: 'bg-sand text-text-200',
+  chunking: 'bg-sand text-text-200',
+  embedding: 'bg-sand text-text-200',
 };
+
+const IN_FLIGHT = new Set(['queued', 'pending_ingest', 'parsing', 'chunking', 'embedding']);
+
+const FILE_BADGE: Record<string, string> = {
+  pdf: 'bg-[#C0472F]',
+  docx: 'bg-[#2B579A]',
+  pptx: 'bg-[#C4652A]',
+  xlsx: 'bg-[#1E7145]',
+  txt: 'bg-[#4A5555]',
+};
+
+/** Renders a small coloured file-type badge based on the filename extension. */
+function FileBadge({ name }: { name: string }) {
+  const ext = (name.toLowerCase().split('.').pop() ?? '').slice(0, 4);
+  return (
+    <span
+      className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[9px] font-bold uppercase tracking-wide text-white ${
+        FILE_BADGE[ext] ?? 'bg-text-400'
+      }`}
+    >
+      {ext || 'file'}
+    </span>
+  );
+}
+
+/** Formats an ISO timestamp as a short locale date and time. */
+function shortDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleString(undefined, {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+/** Displays one summary metric card on the admin dashboard. */
+function StatCard({
+  icon,
+  label,
+  value,
+  hint,
+  hintTone = 'text-text-400',
+  iconTone = 'text-accent',
+}: {
+  icon: ReactNode;
+  label: string;
+  value: number;
+  hint: string;
+  hintTone?: string;
+  iconTone?: string;
+}) {
+  return (
+    <div className="panel flex items-center gap-4 p-5">
+      <div
+        className={`flex h-14 w-14 shrink-0 items-center justify-center rounded-full border border-border bg-bg-0 shadow-sm ${iconTone}`}
+      >
+        {icon}
+      </div>
+      <div className="min-w-0">
+        <div className="text-sm text-text-300">{label}</div>
+        <div className="font-serif text-3xl font-semibold leading-tight text-text-100">{value}</div>
+        <div className={`text-xs ${hintTone}`}>{hint}</div>
+      </div>
+    </div>
+  );
+}
 
 type Toast = { id: number; tone: 'error' | 'info'; message: string };
 
@@ -86,6 +168,7 @@ export default function Admin() {
   const [replacePrompt, setReplacePrompt] = useState<ReplacePrompt | null>(null);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [dragOver, setDragOver] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
 
   function pushToast(tone: Toast['tone'], message: string) {
@@ -319,107 +402,166 @@ export default function Admin() {
   }
 
   const stagedCount = files.filter((f) => f.status === 'staged').length;
+  const readyCount = files.filter((f) => f.status === 'ready').length;
+  const processingCount = files.filter((f) => IN_FLIGHT.has(f.status)).length;
+  const failedCount = files.filter((f) => f.status === 'failed' || f.status === 'delete_failed').length;
+  const pctOf = (n: number) => (files.length ? `${((n / files.length) * 100).toFixed(1)}% of total` : '—');
 
   return (
-    <main className="mx-auto max-w-5xl p-4 sm:p-6 md:p-8">
-      <header className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-xl font-semibold tracking-tight text-foreground sm:text-2xl">
-            Admin · Knowledge base
-          </h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Upload, list, and manage the documents users can chat with.
-          </p>
+    <div className="flex min-h-[100dvh] gap-3 bg-background p-3">
+      <aside className="panel sticky top-3 hidden h-[calc(100dvh-1.5rem)] w-64 shrink-0 flex-col lg:flex">
+        <div className="relative flex flex-col items-center px-6 pb-6 pt-8 text-center">
+          <ThemeToggle className="absolute right-3 top-3" />
+          <img src="/logo-short.png" alt="" className="h-20 w-20 object-contain" />
+          <div className="mt-3 font-serif text-2xl font-semibold tracking-tight text-accent">1stAId4SME</div>
+          <div className="eyebrow mt-1">Knowledge base admin</div>
         </div>
-        <button
-          type="button"
-          onClick={logoutAdmin}
-          className="self-start rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition hover:bg-muted sm:self-auto"
-        >
-          Sign out
-        </button>
-      </header>
+        <nav className="px-3">
+          <div className="relative flex items-center gap-3 rounded-xl bg-sand px-4 py-3 text-sm font-medium text-accent">
+            <span className="absolute bottom-2 left-0 top-2 w-[3px] rounded-full bg-accent" />
+            <BookOpen className="h-4 w-4" />
+            Documents
+          </div>
+        </nav>
+        <div className="mt-auto p-3">
+          <div className="flex items-center gap-3 rounded-2xl border border-border bg-bg-100 px-3 py-2.5">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-accent text-xs font-semibold text-white">
+              KB
+            </div>
+            <div className="min-w-0 flex-1 truncate text-sm font-medium text-text-100">Administrator</div>
+            <button
+              type="button"
+              onClick={logoutAdmin}
+              title="Sign out"
+              className="rounded-lg p-1.5 text-text-400 transition hover:bg-bg-200 hover:text-accent"
+            >
+              <LogOut className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      </aside>
 
-      <section className="mt-6">
-        <div
-          onDragOver={(e) => e.preventDefault()}
-          onDrop={(e) => {
-            e.preventDefault();
-            handleFiles(e.dataTransfer.files);
-          }}
-          onClick={() => fileInput.current?.click()}
-          className="cursor-pointer rounded-lg border-2 border-dashed border-border bg-background p-6 text-center transition hover:border-primary/50 hover:bg-accent/20 sm:p-10"
-        >
-          <p className="text-sm font-medium text-foreground">
-            Drop files here or click to browse
-          </p>
-          <p className="mt-1 text-xs text-muted-foreground">
-            PDF, DOCX, PPTX, XLSX, TXT — multi-select supported
-          </p>
-          <input
-            ref={fileInput}
-            type="file"
-            multiple
-            hidden
-            accept=".pdf,.docx,.pptx,.xlsx,.txt"
-            onChange={(e) => handleFiles(e.target.files)}
+      <main className="min-w-0 flex-1 space-y-4 sm:px-2 sm:py-1">
+        <header className="flex items-center justify-between gap-3 px-1 pt-1">
+          <div className="flex items-center gap-3">
+            <img src="/logo-short.png" alt="" className="h-10 w-10 object-contain lg:hidden" />
+            <div>
+              <h1 className="font-serif text-2xl font-semibold tracking-tight text-text-100 sm:text-3xl">
+                Documents
+                <InfoTip side="bottom" className="ml-2">
+                  Upload, track and manage the documents users can chat with.
+                </InfoTip>
+              </h1>
+            </div>
+          </div>
+          <button type="button" onClick={logoutAdmin} className="btn-ghost lg:hidden">
+            <LogOut className="h-4 w-4" />
+            <span className="hidden sm:inline">Sign out</span>
+          </button>
+        </header>
+
+        <section className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          <StatCard icon={<FileText className="h-6 w-6" />} label="Total documents" value={files.length} hint="In the knowledge base" iconTone="text-text-200" />
+          <StatCard icon={<CheckCircle2 className="h-6 w-6" />} label="Ready" value={readyCount} hint={pctOf(readyCount)} hintTone="text-accent" />
+          <StatCard
+            icon={<Loader className={`h-6 w-6 ${processingCount > 0 ? 'animate-spin [animation-duration:2.5s]' : ''}`} />}
+            label="Processing"
+            value={processingCount}
+            hint={pctOf(processingCount)}
+            iconTone="text-text-200"
           />
-        </div>
-      </section>
+          <StatCard icon={<AlertCircle className="h-6 w-6" />} label="Failed" value={failedCount} hint={pctOf(failedCount)} hintTone="text-danger" iconTone="text-danger" />
+        </section>
+
+        <section className="panel p-3">
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              handleFiles(e.dataTransfer.files);
+            }}
+            onClick={() => fileInput.current?.click()}
+            className={`flex cursor-pointer flex-col items-center rounded-2xl border-2 border-dashed px-6 py-8 text-center transition sm:py-10 ${
+              dragOver ? 'border-accent bg-accent/5' : 'border-bg-300 hover:border-accent/50 hover:bg-bg-0'
+            }`}
+          >
+            <div className="flex h-16 w-16 items-center justify-center rounded-full bg-accent text-white shadow-[0_10px_24px_-10px_rgba(15,94,94,0.7)]">
+              <UploadCloud className="h-7 w-7" />
+            </div>
+            <p className="mt-4 flex items-center gap-1.5 font-serif text-xl font-semibold text-accent">
+              Upload documents
+              <span onClick={(e) => e.stopPropagation()}>
+                <InfoTip side="top">
+                  Drag and drop files here, or click to browse. Supports PDF, DOCX, PPTX, XLSX and TXT, multi-select allowed.
+                </InfoTip>
+              </span>
+            </p>
+            <input
+              ref={fileInput}
+              type="file"
+              multiple
+              hidden
+              accept=".pdf,.docx,.pptx,.xlsx,.txt"
+              onChange={(e) => handleFiles(e.target.files)}
+            />
+          </div>
+        </section>
 
       {stagedCount > 0 && (
-        <section className="mt-4 flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <section className="panel flex flex-col gap-3 border-warn/30 bg-warn-soft/60 p-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
           <div>
-            <p className="text-sm font-medium text-amber-900">
+            <p className="text-sm font-semibold text-warn">
               {stagedCount} file{stagedCount === 1 ? '' : 's'} staged
-            </p>
-            <p className="mt-0.5 text-xs text-amber-800/80">
-              Files are uploaded but not ingested yet. Click Start to begin parsing &amp;
-              embedding.
+              <InfoTip side="bottom" className="ml-1.5">
+                Files are uploaded but not ingested yet. Start ingestion to begin parsing &amp; embedding.
+              </InfoTip>
             </p>
           </div>
-          <button
-            type="button"
-            onClick={startIngestion}
-            className="shrink-0 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90"
-          >
+          <button type="button" onClick={startIngestion} className="btn-primary shrink-0">
+            <Play className="h-4 w-4" />
             Start ingestion ({stagedCount})
           </button>
         </section>
       )}
 
       {uploads.length > 0 && (
-        <section className="mt-4 rounded-lg border border-border bg-background p-4">
-          <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-            Uploads
-          </h3>
+        <section className="panel p-5">
+          <h3 className="eyebrow">Uploads</h3>
           <ul className="mt-3 space-y-3">
             {uploads.map((u) => (
               <li key={u.key} className="text-sm">
-                <div className="flex items-center justify-between">
-                  <span className="truncate font-medium text-foreground">{u.filename}</span>
-                  <span className="ml-3 text-xs text-muted-foreground">
-                    {u.phase === 'uploading' && `${Math.round((u.loaded / u.total) * 100)}%`}
-                    {u.phase === 'done' && 'Uploaded — staged'}
-                    {u.phase === 'duplicate' && `Skipped — ${u.message}`}
-                    {u.phase === 'conflict' && 'Name conflict — awaiting decision'}
-                    {u.phase === 'error' && `Error — ${u.message}`}
-                  </span>
-                </div>
-                <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-muted">
-                  <div
-                    className={`h-full transition-all ${
-                      u.phase === 'error' || u.phase === 'duplicate'
-                        ? 'bg-red-400'
-                        : 'bg-primary'
-                    }`}
-                    style={{
-                      width:
-                        u.phase === 'done'
-                          ? '100%'
-                          : `${Math.min(100, (u.loaded / Math.max(1, u.total)) * 100)}%`,
-                    }}
-                  />
+                <div className="flex items-center gap-3">
+                  <FileBadge name={u.filename} />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center justify-between">
+                      <span className="truncate font-medium text-text-100">{u.filename}</span>
+                      <span className="ml-3 shrink-0 text-xs text-text-400">
+                        {u.phase === 'uploading' && `${Math.round((u.loaded / u.total) * 100)}%`}
+                        {u.phase === 'done' && 'Uploaded — staged'}
+                        {u.phase === 'duplicate' && `Skipped — ${u.message}`}
+                        {u.phase === 'conflict' && 'Name conflict — awaiting decision'}
+                        {u.phase === 'error' && `Error — ${u.message}`}
+                      </span>
+                    </div>
+                    <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-bg-200">
+                      <div
+                        className={`h-full rounded-full transition-all ${
+                          u.phase === 'error' || u.phase === 'duplicate' ? 'bg-danger' : 'bg-accent'
+                        }`}
+                        style={{
+                          width:
+                            u.phase === 'done'
+                              ? '100%'
+                              : `${Math.min(100, (u.loaded / Math.max(1, u.total)) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
                 </div>
               </li>
             ))}
@@ -427,116 +569,130 @@ export default function Admin() {
         </section>
       )}
 
-      <section className="mt-6 rounded-lg border border-border bg-background">
-        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
-          <div className="flex items-center gap-3">
-            {files.length > 0 && (
-              <input
-                type="checkbox"
-                aria-label="Select all files"
-                checked={selected.size === files.length && files.length > 0}
-                ref={(el) => {
-                  if (el) el.indeterminate = selected.size > 0 && selected.size < files.length;
-                }}
-                onChange={toggleSelectAll}
-                className="h-4 w-4 cursor-pointer accent-primary"
-              />
+      <section className="panel overflow-hidden">
+        <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
+          <h3 className="font-serif text-lg font-semibold text-text-100">
+            Library <span className="font-sans text-sm font-normal text-text-400">({files.length})</span>
+            {selected.size > 0 && (
+              <span className="ml-2 font-sans text-sm font-medium text-accent">
+                · {selected.size} selected
+              </span>
             )}
-            <h3 className="text-xs font-medium uppercase tracking-wider text-muted-foreground">
-              Files ({files.length})
-              {selected.size > 0 && (
-                <span className="ml-2 normal-case tracking-normal text-foreground">
-                  · {selected.size} selected
-                </span>
-              )}
-            </h3>
-          </div>
-          {files.length > 0 && (
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={toggleSelectAll}
-                className="rounded-md border border-border px-3 py-1 text-xs font-medium text-muted-foreground transition hover:bg-muted"
-              >
-                {selected.size === files.length ? 'Deselect all' : 'Select all'}
-              </button>
-              {selected.size > 0 && (
-                <button
-                  type="button"
-                  onClick={delSelected}
-                  className="rounded-md border border-red-200 bg-red-50 px-3 py-1 text-xs font-medium text-red-700 transition hover:bg-red-100"
-                >
-                  Delete selected ({selected.size})
-                </button>
-              )}
-            </div>
+          </h3>
+          {selected.size > 0 && (
+            <button
+              type="button"
+              onClick={delSelected}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-danger/30 bg-danger-soft px-3 py-1.5 text-xs font-medium text-danger transition hover:opacity-90"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              Delete selected ({selected.size})
+            </button>
           )}
         </header>
         {files.length === 0 ? (
-          <div className="p-8 text-center text-sm text-muted-foreground">
+          <div className="p-10 text-center text-sm text-text-400">
             No files yet. Drop one above to get started.
           </div>
         ) : (
-          <ul className="divide-y divide-border">
-            {files.map((f) => {
-              const inFlight = ['parsing', 'chunking', 'embedding'].includes(f.status);
-              const pct =
-                f.stage_total > 0
-                  ? Math.round((f.stage_current / f.stage_total) * 100)
-                  : 0;
-              return (
-                <li key={f.id} className="flex items-center gap-3 px-4 py-3 sm:gap-4">
-                  <input
-                    type="checkbox"
-                    aria-label={`Select ${f.filename}`}
-                    checked={selected.has(f.id)}
-                    onChange={() => toggleSelect(f.id)}
-                    className="h-4 w-4 shrink-0 cursor-pointer accent-primary"
-                  />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                      <span className="min-w-0 truncate text-sm font-medium text-foreground">
-                        {f.filename}
-                      </span>
-                      <span
-                        className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium ${
-                          STATUS_TONE[f.status] ?? 'bg-muted text-muted-foreground'
-                        }`}
-                      >
-                        {STATUS_LABEL[f.status] ?? f.status}
-                      </span>
-                    </div>
-                    <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
-                      <span>{humanSize(f.size_bytes)}</span>
-                      {inFlight && f.stage_total > 0 && (
-                        <span>
-                          {f.stage_current}/{f.stage_total} chunks
-                        </span>
-                      )}
-                      {f.status === 'failed' && f.error_message && (
-                        <span className="break-all text-red-600">{f.error_message}</span>
-                      )}
-                    </div>
-                    {inFlight && (
-                      <div className="mt-2 h-1 overflow-hidden rounded-full bg-muted">
-                        <div
-                          className="h-full bg-primary transition-all"
-                          style={{ width: `${pct}%` }}
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[760px] text-sm">
+              <thead>
+                <tr className="border-b border-border text-left text-xs font-medium text-text-400">
+                  <th className="w-12 py-3 pl-5 pr-2">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all files"
+                      checked={selected.size === files.length && files.length > 0}
+                      ref={(el) => {
+                        if (el) el.indeterminate = selected.size > 0 && selected.size < files.length;
+                      }}
+                      onChange={toggleSelectAll}
+                      className="h-4 w-4 cursor-pointer accent-[#0F5E5E]"
+                    />
+                  </th>
+                  <th className="px-3 py-3 font-medium">File name</th>
+                  <th className="px-3 py-3 font-medium">Size</th>
+                  <th className="px-3 py-3 font-medium">Status</th>
+                  <th className="px-3 py-3 font-medium">Progress</th>
+                  <th className="px-3 py-3 font-medium">Updated</th>
+                  <th className="py-3 pl-3 pr-5 text-right font-medium">Actions</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-border">
+                {files.map((f) => {
+                  const inFlight = ['parsing', 'chunking', 'embedding'].includes(f.status);
+                  const pct =
+                    f.stage_total > 0 ? Math.round((f.stage_current / f.stage_total) * 100) : 0;
+                  const isSel = selected.has(f.id);
+                  return (
+                    <tr key={f.id} className={`transition ${isSel ? 'bg-sand/60' : 'hover:bg-bg-0'}`}>
+                      <td className="py-3 pl-5 pr-2">
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${f.filename}`}
+                          checked={isSel}
+                          onChange={() => toggleSelect(f.id)}
+                          className="h-4 w-4 cursor-pointer accent-[#0F5E5E]"
                         />
-                      </div>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => del(f.id)}
-                    className="shrink-0 rounded-md border border-border px-2.5 py-1 text-xs font-medium text-muted-foreground transition hover:border-red-200 hover:bg-red-50 hover:text-red-700"
-                  >
-                    Delete
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
+                      </td>
+                      <td className="max-w-[320px] px-3 py-3">
+                        <div className="flex items-center gap-3">
+                          <FileBadge name={f.filename} />
+                          <div className="min-w-0">
+                            <div className="truncate font-medium text-text-100" title={f.filename}>
+                              {f.filename}
+                            </div>
+                            {f.status === 'failed' && f.error_message && (
+                              <div className="truncate text-xs text-danger" title={f.error_message}>
+                                {f.error_message}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-3 text-text-300">{humanSize(f.size_bytes)}</td>
+                      <td className="px-3 py-3">
+                        <span
+                          className={`inline-flex whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-medium ${
+                            STATUS_TONE[f.status] ?? 'bg-bg-200 text-text-300'
+                          }`}
+                        >
+                          {STATUS_LABEL[f.status] ?? f.status}
+                        </span>
+                      </td>
+                      <td className="px-3 py-3">
+                        {inFlight ? (
+                          <div className="flex items-center gap-2.5">
+                            <span className="w-9 text-right text-xs tabular-nums text-text-300">{pct}%</span>
+                            <div className="h-1.5 w-28 overflow-hidden rounded-full bg-bg-200">
+                              <div
+                                className="h-full rounded-full bg-accent transition-all"
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          </div>
+                        ) : (
+                          <span className="text-text-500">—</span>
+                        )}
+                      </td>
+                      <td className="whitespace-nowrap px-3 py-3 text-text-300">{shortDate(f.updated_at)}</td>
+                      <td className="py-3 pl-3 pr-5 text-right">
+                        <button
+                          type="button"
+                          onClick={() => del(f.id)}
+                          title="Delete file"
+                          className="rounded-lg p-2 text-text-400 transition hover:bg-danger-soft hover:text-danger"
+                        >
+                          <Trash2 className="h-4 w-4" />
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
       </section>
 
@@ -544,10 +700,10 @@ export default function Admin() {
         {toasts.map((t) => (
           <div
             key={t.id}
-            className={`pointer-events-auto rounded-md border px-4 py-3 text-sm shadow-sm ${
+            className={`pointer-events-auto rounded-2xl border px-4 py-3 text-sm shadow-[0_10px_30px_-12px_rgba(70,55,25,0.3)] ${
               t.tone === 'error'
-                ? 'border-red-200 bg-red-50 text-red-800'
-                : 'border-border bg-background text-foreground'
+                ? 'border-danger/30 bg-danger-soft text-danger'
+                : 'border-border bg-bg-100 text-text-100'
             }`}
           >
             {t.message}
@@ -556,11 +712,11 @@ export default function Admin() {
       </div>
 
       {replacePrompt && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-lg border border-border bg-background p-6 shadow-lg">
-            <h3 className="text-base font-semibold text-foreground">File already exists</h3>
-            <p className="mt-2 text-sm text-muted-foreground">
-              A file named <span className="font-medium">{replacePrompt.file.name}</span> already
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-scrim p-4 backdrop-blur-sm">
+          <div className="panel w-full max-w-sm p-6">
+            <h3 className="font-serif text-xl font-semibold text-text-100">File already exists</h3>
+            <p className="mt-2 text-sm text-text-300">
+              A file named <span className="font-medium text-text-100">{replacePrompt.file.name}</span> already
               exists (status: {replacePrompt.existingStatus}). Replace it with the new version?
               The old content and all of its embeddings will be dropped.
             </p>
@@ -573,21 +729,18 @@ export default function Admin() {
                   );
                   setReplacePrompt(null);
                 }}
-                className="rounded-md border border-border px-3 py-1.5 text-sm font-medium text-muted-foreground transition hover:bg-muted"
+                className="btn-ghost"
               >
                 Cancel
               </button>
-              <button
-                type="button"
-                onClick={confirmReplace}
-                className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition hover:opacity-90"
-              >
+              <button type="button" onClick={confirmReplace} className="btn-primary">
                 Replace
               </button>
             </div>
           </div>
         </div>
       )}
-    </main>
+      </main>
+    </div>
   );
 }

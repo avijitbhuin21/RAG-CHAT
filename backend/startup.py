@@ -46,6 +46,12 @@ def _init_schema() -> None:
                 "ADD COLUMN IF NOT EXISTS tool_calls JSONB"
             )
         )
+        conn.execute(
+            text(
+                "ALTER TABLE messages "
+                "ADD COLUMN IF NOT EXISTS attachments JSONB"
+            )
+        )
     log.info("schema create_all OK")
 
 

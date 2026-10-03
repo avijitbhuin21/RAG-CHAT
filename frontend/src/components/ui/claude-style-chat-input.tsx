@@ -250,7 +250,7 @@ export const ClaudeChatInput: React.FC<ClaudeChatInputProps> = ({
       onDrop={onDrop}
     >
       <div
-        className="!box-content flex flex-col mx-2 md:mx-0 items-stretch transition-all duration-200 relative z-10 rounded-2xl cursor-text border border-bg-300 shadow-[0_0_15px_rgba(0,0,0,0.06)] hover:shadow-[0_0_20px_rgba(0,0,0,0.1)] focus-within:shadow-[0_0_25px_rgba(14,165,233,0.15)] bg-bg-100 font-sans antialiased"
+        className="!box-content flex flex-col mx-2 md:mx-0 items-stretch transition-all duration-200 relative z-10 rounded-[20px] cursor-text border border-border shadow-[0_10px_30px_-14px_rgba(70,55,25,0.22)] hover:shadow-[0_12px_34px_-14px_rgba(70,55,25,0.28)] focus-within:border-accent/40 focus-within:shadow-[0_12px_34px_-12px_rgba(15,94,94,0.25)] bg-bg-100 font-sans antialiased"
       >
         <div className="flex flex-col px-3 pt-3 gap-2">
           {(files.length > 0 || pastedContent.length > 0) && (
@@ -291,10 +291,10 @@ export const ClaudeChatInput: React.FC<ClaudeChatInputProps> = ({
             <button
               onClick={handleSend}
               disabled={!hasContent || disabled}
-              className={`absolute right-0 bottom-[0.65rem] inline-flex items-center justify-center h-8 w-8 rounded-xl transition-colors active:scale-95 ${
+              className={`absolute right-0 bottom-[0.55rem] inline-flex items-center justify-center h-9 w-9 rounded-xl transition-colors active:scale-95 ${
                 hasContent && !disabled
                   ? 'bg-accent text-white hover:bg-accent-hover shadow-md'
-                  : 'bg-accent/30 text-white/70 cursor-default'
+                  : 'bg-accent/25 text-white/80 cursor-default'
               }`}
               type="button"
               aria-label="Send message"

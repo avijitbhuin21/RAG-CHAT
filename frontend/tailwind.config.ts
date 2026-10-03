@@ -2,6 +2,7 @@ import type { Config } from 'tailwindcss';
 
 export default {
   content: ['./index.html', './src/**/*.{ts,tsx}'],
+  darkMode: 'class',
   theme: {
     extend: {
       colors: {
@@ -17,11 +18,25 @@ export default {
           foreground: 'hsl(var(--muted-foreground))',
         },
         accent: {
-          DEFAULT: 'var(--accent)',
+          DEFAULT: 'rgb(var(--accent-rgb) / <alpha-value>)',
           foreground: 'var(--accent-foreground)',
           hover: 'var(--accent-hover)',
         },
         'accent-hover': 'var(--accent-hover)',
+        danger: {
+          DEFAULT: 'rgb(var(--danger-rgb) / <alpha-value>)',
+          soft: 'rgb(var(--danger-soft-rgb) / <alpha-value>)',
+        },
+        warn: {
+          DEFAULT: 'rgb(var(--warn-rgb) / <alpha-value>)',
+          soft: 'rgb(var(--warn-soft-rgb) / <alpha-value>)',
+        },
+        sand: 'rgb(var(--sand-rgb) / <alpha-value>)',
+        inverse: {
+          DEFAULT: 'var(--inverse)',
+          fg: 'var(--inverse-fg)',
+        },
+        scrim: 'var(--scrim)',
         bg: {
           0: 'var(--bg-0)',
           100: 'var(--bg-100)',
@@ -29,7 +44,7 @@ export default {
           300: 'var(--bg-300)',
         },
         text: {
-          100: 'var(--text-100)',
+          100: 'rgb(var(--text-100-rgb) / <alpha-value>)',
           200: 'var(--text-200)',
           300: 'var(--text-300)',
           400: 'var(--text-400)',
@@ -42,8 +57,9 @@ export default {
         sm: 'calc(var(--radius) - 4px)',
       },
       fontFamily: {
-        sans: ['"Source Serif 4"', 'Georgia', 'serif'],
-        serif: ['"Source Serif 4"', 'Georgia', 'serif'],
+        sans: ['"Victor Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        serif: ['"Victor Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
+        mono: ['"Victor Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],
       },
       keyframes: {
         'fade-in': {

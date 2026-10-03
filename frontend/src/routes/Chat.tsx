@@ -1,12 +1,17 @@
-import { ChevronDown, LogOut, Menu, Plus, Trash2 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
+import { LogOut, Menu, PanelRightClose, Sparkles, Trash2 } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 
-import ClaudeChatInput from '../components/ui/claude-style-chat-input';
-import ShaderBackground from '../components/ui/shader-background';
-import { AssistantMessage, type AssistantMsg, type Citation, type ToolCall } from '../components/chat/AssistantMessage';
+import { Composer } from '../components/chat/Composer';
+import { MessageRow, type ChatMsg, type Citation } from '../components/chat/MessageRow';
 import { SourcePanel, type SourcePanelTarget } from '../components/chat/SourcePanel';
+import { appendThinking, type ChainStep } from '../components/chat/ThinkingChain';
+import { useAttachments } from '../components/chat/attachments';
+import { InfoTip } from '../components/ui/InfoTip';
+import { ThreadRail } from '../components/chat/ThreadRail';
 import { api } from '../lib/api';
 import { useSession } from '../lib/auth';
+import { EASE, RISE, SLIDE } from '../lib/motion';
 import { streamSSE } from '../lib/stream';
 
 type ChatSummary = {
@@ -16,36 +21,48 @@ type ChatSummary = {
   updated_at: string;
 };
 
-type Msg = {
-  id: string;
-  role: 'user' | 'assistant';
-  content: string;
-  thinking: string | null;
-  citations: Citation[] | null;
-  tool_calls: ToolCall[] | null;
-  streaming?: boolean;
-  thinkingStartedAt?: number | null;
-  thinkingEndedAt?: number | null;
-};
+const STARTERS = [
+  'What is the 1stAId4SME project about?',
+  'Summarise the key points of the project manual',
+  'How can SMEs start using generative AI?',
+  'Which training modules are covered?',
+];
+
+const PIN_THRESHOLD = 90;
 
 export default function Chat() {
   const { session, logoutUser } = useSession();
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<Msg[]>([]);
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
   const [showSignOut, setShowSignOut] = useState(false);
-  const [historyOpen, setHistoryOpen] = useState(true);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [sourceTarget, setSourceTarget] = useState<SourcePanelTarget | null>(null);
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const att = useAttachments();
 
-  function openSource(c: Citation) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const pinnedRef = useRef(true);
+  const messageCache = useRef<Map<string, ChatMsg[]>>(new Map());
+  const messagesRef = useRef<ChatMsg[]>(messages);
+  const activeIdRef = useRef<string | null>(activeId);
+  const inlineCreatedRef = useRef<Set<string>>(new Set());
+  const abortRef = useRef<AbortController | null>(null);
+  const pendingContent = useRef('');
+  const pendingThinking = useRef('');
+  const frameRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+  useEffect(() => {
+    activeIdRef.current = activeId;
+  }, [activeId]);
+
+  const openSource = useCallback((c: Citation) => {
     if (!c.file_id) return;
-    // Prefer the per-file chunk_texts[] emitted by the new backend. Fall back
-    // to the single-chunk `chunk_text` or truncated `snippet` so citations on
-    // messages saved before those format changes still open the panel.
     const chunkTexts =
       c.chunk_texts && c.chunk_texts.length > 0
         ? c.chunk_texts
@@ -54,27 +71,10 @@ export default function Chat() {
           : c.snippet
             ? [c.snippet]
             : [];
-    setSourceTarget({
-      fileId: c.file_id,
-      filename: c.filename,
-      chunkTexts,
-    });
-  }
+    setSourceTarget({ fileId: c.file_id, filename: c.filename, chunkTexts });
+  }, []);
 
-  const messageCache = useRef<Map<string, Msg[]>>(new Map());
-  const messagesRef = useRef<Msg[]>(messages);
-  const activeIdRef = useRef<string | null>(activeId);
-  // Chats created inline from the welcome screen — their state is owned by
-  // the active send() call, so the activeId effect must not refetch and
-  // overwrite the optimistic messages with an empty GET response.
-  const inlineCreatedRef = useRef<Set<string>>(new Set());
-
-  useEffect(() => {
-    messagesRef.current = messages;
-  }, [messages]);
-  useEffect(() => {
-    activeIdRef.current = activeId;
-  }, [activeId]);
+  const closeSource = useCallback(() => setSourceTarget(null), []);
 
   async function refreshChats() {
     const list = await api<ChatSummary[]>('/chat/chats');
@@ -85,13 +85,7 @@ export default function Chat() {
   async function loadMessages(chatId: string) {
     const cached = messageCache.current.get(chatId);
     if (cached) setMessages(cached);
-    const t0 = performance.now();
-    const rows = await api<Msg[]>(`/chat/chats/${chatId}/messages`);
-    console.debug(
-      '[loadMessages]',
-      chatId,
-      `${(performance.now() - t0).toFixed(0)}ms`,
-    );
+    const rows = await api<ChatMsg[]>(`/chat/chats/${chatId}/messages`);
     const fresh = rows.map((m) => ({ ...m, streaming: false }));
     messageCache.current.set(chatId, fresh);
     if (activeIdRef.current === chatId) setMessages(fresh);
@@ -105,10 +99,9 @@ export default function Chat() {
 
   useEffect(() => {
     const chatId = activeId;
+    pinnedRef.current = true;
     if (chatId) {
-      if (!inlineCreatedRef.current.has(chatId)) {
-        loadMessages(chatId);
-      }
+      if (!inlineCreatedRef.current.has(chatId)) loadMessages(chatId);
     } else {
       setMessages([]);
     }
@@ -118,18 +111,63 @@ export default function Chat() {
   }, [activeId]);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
+    const el = scrollRef.current;
+    if (el && pinnedRef.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
 
+  function onScroll() {
+    const el = scrollRef.current;
+    if (!el) return;
+    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < PIN_THRESHOLD;
+  }
+
+  function updateLast(fn: (m: ChatMsg) => ChatMsg) {
+    setMessages((prev) => {
+      const last = prev[prev.length - 1];
+      if (!last || last.role !== 'assistant') return prev;
+      return [...prev.slice(0, -1), fn(last)];
+    });
+  }
+
+  function flush() {
+    if (frameRef.current !== null) {
+      cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    }
+    const c = pendingContent.current;
+    const t = pendingThinking.current;
+    if (!c && !t) return;
+    pendingContent.current = '';
+    pendingThinking.current = '';
+    updateLast((m) => ({
+      ...m,
+      content: m.content + c,
+      thinking: (m.thinking ?? '') + t,
+      steps: t ? appendThinking(m.steps ?? [], t) : m.steps,
+    }));
+  }
+
+  function schedule() {
+    if (frameRef.current === null) {
+      frameRef.current = requestAnimationFrame(() => {
+        frameRef.current = null;
+        flush();
+      });
+    }
+  }
+
   function newChat() {
+    abortRef.current?.abort();
     setActiveId(null);
     setMessages([]);
-    setSidebarOpen(false);
+    setDrawerOpen(false);
+    setSourceTarget(null);
   }
 
   function selectChat(id: string) {
     setActiveId(id);
-    setSidebarOpen(false);
+    setDrawerOpen(false);
+    setSourceTarget(null);
   }
 
   async function deleteChat(id: string) {
@@ -144,132 +182,138 @@ export default function Chat() {
     }
   }
 
-  const pendingDeleteChat = chats.find((c) => c.id === pendingDeleteId);
+  function stop() {
+    abortRef.current?.abort();
+  }
 
   async function send(rawText: string) {
     const userText = rawText.trim();
-    if (!userText || sending) return;
+    const metas = att.ready;
+    if ((!userText && metas.length === 0) || sending || att.uploading) return;
     setSending(true);
+    setDraft('');
+    att.clear();
+    pinnedRef.current = true;
+    pendingContent.current = '';
+    pendingThinking.current = '';
 
-    // Optimistic: place the user message + a streaming assistant placeholder
-    // BEFORE awaiting the (possibly slow) chat-creation roundtrip. This flips
-    // the view out of the welcome screen immediately and, critically, prevents
-    // the `activeId` effect from overwriting these messages with an empty GET
-    // response when we create a new chat inline.
-    const userMsg: Msg = {
-      id: `tmp-user-${Date.now()}`,
+    const now = Date.now();
+    const userMsg: ChatMsg = {
+      id: `tmp-user-${now}`,
       role: 'user',
       content: userText,
       thinking: null,
       citations: null,
       tool_calls: null,
+      attachments: metas,
     };
-    const assistantMsg: Msg = {
-      id: `tmp-asst-${Date.now()}`,
+    const assistantMsg: ChatMsg = {
+      id: `tmp-asst-${now}`,
       role: 'assistant',
       content: '',
       thinking: '',
       citations: null,
       tool_calls: [],
+      steps: [],
       streaming: true,
-      thinkingStartedAt: null,
-      thinkingEndedAt: null,
+      startedAt: now,
     };
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
-    let chatId = activeId;
-    if (!chatId) {
-      const chat = await api<ChatSummary>('/chat/chats', { method: 'POST' });
-      chatId = chat.id;
-      setChats((prev) => [chat, ...prev]);
-      inlineCreatedRef.current.add(chatId);
-      setActiveId(chatId);
-    }
+    const controller = new AbortController();
+    abortRef.current = controller;
 
+    let chatId = activeId;
     try {
+      if (!chatId) {
+        const chat = await api<ChatSummary>('/chat/chats', { method: 'POST' });
+        chatId = chat.id;
+        setChats((prev) => [chat, ...prev]);
+        inlineCreatedRef.current.add(chatId);
+        setActiveId(chatId);
+      }
+
       await streamSSE(
         `/chat/chats/${chatId}/messages`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: userText }),
+          body: JSON.stringify({ content: userText, attachment_ids: metas.map((m) => m.id) }),
+          signal: controller.signal,
         },
         (event) => {
-          // eslint-disable-next-line no-console
-          console.debug('[chat sse]', event.type, event);
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
-            if (!last || last.role !== 'assistant') return prev;
-            const updated: Msg = { ...last };
-            if (event.type === 'citations') {
-              updated.citations = event.citations;
-            } else if (event.type === 'thinking_start') {
-              // marker only; actual start time captured on first thinking_delta
-            } else if (event.type === 'thinking_delta') {
-              if (!updated.thinkingStartedAt) updated.thinkingStartedAt = Date.now();
-              updated.thinking = (updated.thinking ?? '') + event.content;
-            } else if (event.type === 'tool_call_start') {
-              if (updated.thinkingStartedAt && !updated.thinkingEndedAt) {
-                updated.thinkingEndedAt = Date.now();
-              }
-              // Use `index` from the event to place this entry at the right
-              // slot. Parallel tool calls all start before any finishes, and
-              // done events may arrive out of order — matching on index
-              // prevents a "searching forever" sibling entry.
-              const existing = updated.tool_calls ?? [];
-              const copy = existing.slice();
-              const slot = typeof event.index === 'number' ? event.index : copy.length;
-              copy[slot] = { name: event.name, query: event.query ?? null, done: false };
-              updated.tool_calls = copy;
-            } else if (event.type === 'tool_call_done') {
-              const calls = updated.tool_calls ?? [];
-              if (calls.length > 0) {
-                const copy = calls.slice();
-                // Prefer the explicit index; fall back to first not-yet-done
-                // entry (for any legacy events without it).
-                let slot =
-                  typeof event.index === 'number' ? event.index : -1;
-                if (slot < 0 || slot >= copy.length) {
-                  slot = copy.findIndex((c) => c && c.done === false);
-                }
-                if (slot >= 0 && copy[slot]) {
-                  copy[slot] = { ...copy[slot], done: true };
-                  updated.tool_calls = copy;
-                }
-              }
-            } else if (event.type === 'content_delta') {
-              if (updated.thinkingStartedAt && !updated.thinkingEndedAt) {
-                updated.thinkingEndedAt = Date.now();
-              }
-              updated.content = updated.content + event.content;
-            } else if (event.type === 'content_reset') {
-              // Backend hit a transient upstream error mid-stream and is
-              // retrying. Drop the partial answer so the retried output
-              // doesn't stack on top of the aborted one.
-              updated.content = '';
-            } else if (event.type === 'done') {
-              updated.id = event.message_id;
-              updated.streaming = false;
-              if (updated.thinkingStartedAt && !updated.thinkingEndedAt) {
-                updated.thinkingEndedAt = Date.now();
-              }
-            }
-            return [...prev.slice(0, -1), updated];
-          });
+          switch (event.type) {
+            case 'thinking_delta':
+              pendingThinking.current += event.content ?? '';
+              schedule();
+              return;
+            case 'content_delta':
+              pendingContent.current += event.content ?? '';
+              schedule();
+              return;
+            case 'content_reset':
+              pendingContent.current = '';
+              if (event.reason === 'retry') pendingThinking.current = '';
+              flush();
+              updateLast((m) =>
+                event.reason === 'retry'
+                  ? { ...m, content: '', thinking: '', steps: [], tool_calls: [] }
+                  : { ...m, content: '' },
+              );
+              return;
+            case 'citations':
+              flush();
+              updateLast((m) => ({ ...m, citations: event.citations }));
+              return;
+            case 'tool_call_start':
+              flush();
+              updateLast((m) => {
+                const copy = (m.tool_calls ?? []).slice();
+                const slot = typeof event.index === 'number' ? event.index : copy.length;
+                copy[slot] = { name: event.name, query: event.query ?? null, done: false, offset: event.offset };
+                const steps: ChainStep[] = [
+                  ...(m.steps ?? []),
+                  { kind: 'tool', index: slot, query: event.query ?? null, done: false },
+                ];
+                return { ...m, tool_calls: copy, steps };
+              });
+              return;
+            case 'tool_call_done':
+              flush();
+              updateLast((m) => {
+                const copy = (m.tool_calls ?? []).slice();
+                let slot = typeof event.index === 'number' ? event.index : -1;
+                if (slot < 0 || slot >= copy.length) slot = copy.findIndex((c) => c && c.done === false);
+                if (slot >= 0 && copy[slot]) copy[slot] = { ...copy[slot], done: true };
+                const steps = (m.steps ?? []).map((s) =>
+                  s.kind === 'tool' && s.index === slot ? { ...s, done: true } : s,
+                );
+                return { ...m, tool_calls: copy, steps };
+              });
+              return;
+            case 'error':
+              flush();
+              updateLast((m) => ({ ...m, error: event.message ?? 'Something went wrong.' }));
+              return;
+            case 'done':
+              flush();
+              updateLast((m) => ({ ...m, id: event.message_id, streaming: false, endedAt: Date.now() }));
+              return;
+          }
         },
       );
     } catch (e) {
-      setMessages((prev) => {
-        const copy = [...prev];
-        const last = copy[copy.length - 1];
-        if (last && last.role === 'assistant') {
-          last.content = last.content || `_Error: ${String(e)}_`;
-          last.streaming = false;
-        }
-        return copy;
-      });
+      flush();
+      if (controller.signal.aborted) {
+        updateLast((m) => ({ ...m, error: m.content ? null : 'Stopped before an answer was generated.' }));
+      } else {
+        updateLast((m) => ({ ...m, error: `Something went wrong: ${String(e)}` }));
+      }
     } finally {
+      flush();
+      updateLast((m) => (m.streaming ? { ...m, streaming: false, endedAt: Date.now() } : m));
       setSending(false);
+      abortRef.current = null;
       if (chatId) inlineCreatedRef.current.delete(chatId);
       refreshChats();
     }
@@ -279,291 +323,262 @@ export default function Chat() {
   const userName = session.user
     ? session.user.email.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
     : 'there';
+  const firstName = userName.split(' ')[0];
+  const initials =
+    userName
+      .split(' ')
+      .filter(Boolean)
+      .slice(0, 2)
+      .map((w) => w[0])
+      .join('')
+      .toUpperCase() || 'U';
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+  const activeChat = chats.find((c) => c.id === activeId);
+  const pendingDeleteChat = chats.find((c) => c.id === pendingDeleteId);
+  const sourceCount = new Set(
+    messages.flatMap((m) => (m.citations ?? []).map((c) => c.file_id ?? c.filename)),
+  ).size;
+
+  const rail = (
+    <ThreadRail
+      threads={chats}
+      activeId={activeId}
+      account={{
+        name: userName,
+        email: session.user?.email ?? '',
+        initials,
+        photo: session.user?.picture_url ?? null,
+      }}
+      onOpen={selectChat}
+      onNew={newChat}
+      onDelete={setPendingDeleteId}
+      onSignOut={() => setShowSignOut(true)}
+    />
+  );
 
   return (
-    <div className="theme-dark flex h-[100dvh] overflow-hidden">
-      <div className="flex h-full w-full">
-      {sidebarOpen && (
-        <div
-          className="fixed inset-0 z-30 bg-black/40 md:hidden animate-fade-in"
-          onClick={() => setSidebarOpen(false)}
-        />
-      )}
-      <aside
-        className={`fixed inset-y-0 left-0 z-40 flex w-72 flex-col border-r border-border bg-muted transform transition-transform duration-200 md:static md:w-64 md:translate-x-0 ${
-          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
-        }`}
-      >
-        <div className="flex items-center gap-2 border-b border-border px-4 py-2 md:pl-16">
-          <img src="/logo-short.png" alt="" className="h-8 w-8 shrink-0 object-contain" />
-          <span className="font-serif text-lg font-semibold tracking-tight text-foreground">
-            1stAId4SME
-          </span>
-        </div>
+    <div className="flex h-[100dvh] gap-3 overflow-hidden bg-background lg:p-3">
+      <div className="hidden lg:flex">{rail}</div>
 
-        <div className="px-3 pt-3">
+      <AnimatePresence>
+        {drawerOpen && (
+          <>
+            <motion.div
+              key="scrim"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              transition={{ duration: 0.2 }}
+              className="fixed inset-0 z-30 bg-scrim backdrop-blur-[2px] lg:hidden"
+              onClick={() => setDrawerOpen(false)}
+            />
+            <motion.div
+              key="drawer"
+              initial={{ x: '-105%' }}
+              animate={{ x: 0 }}
+              exit={{ x: '-105%' }}
+              transition={SLIDE}
+              className="fixed inset-y-0 left-0 z-40 flex p-3 lg:hidden"
+            >
+              {rail}
+            </motion.div>
+          </>
+        )}
+      </AnimatePresence>
+
+      <main className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+        <header className="flex h-14 shrink-0 items-center gap-2 px-3 lg:px-4">
           <button
             type="button"
-            onClick={newChat}
-            className="flex w-full items-center justify-center gap-2 rounded-xl border border-white/20 bg-gradient-to-b from-sky-400/30 to-sky-600/25 px-3 py-2 text-sm font-semibold text-sky-100 backdrop-blur-xl transition hover:from-sky-400/45 hover:to-sky-600/40 shadow-[inset_0_1px_0_rgba(255,255,255,0.15)]"
-          >
-            <Plus className="h-4 w-4" />
-            New chat
-          </button>
-        </div>
-
-        <nav className="flex-1 overflow-y-auto px-3 pt-3 pb-2">
-          <button
-            type="button"
-            onClick={() => setHistoryOpen((v) => !v)}
-            className="flex w-full items-center justify-between rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground backdrop-blur-xl transition hover:bg-white/10 hover:text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.1)]"
-          >
-            <span>History {chats.length > 0 && <span className="ml-1 font-normal normal-case tracking-normal">({chats.length})</span>}</span>
-            <ChevronDown className={`h-4 w-4 transition-transform ${historyOpen ? '' : '-rotate-90'}`} />
-          </button>
-
-          {historyOpen && (
-            <div className="mt-1 space-y-0.5">
-              {chats.map((c) => {
-                const isActive = c.id === activeId;
-                return (
-                  <div
-                    key={c.id}
-                    onClick={() => selectChat(c.id)}
-                    className={`group relative flex items-center gap-2 overflow-hidden rounded-md px-3 py-2 text-sm cursor-pointer transition ${
-                      isActive
-                        ? 'text-foreground font-semibold'
-                        : 'text-foreground hover:bg-muted'
-                    }`}
-                  >
-                    {isActive && (
-                      <>
-                        <div className="pointer-events-none absolute inset-0 bg-gradient-to-t from-sky-500/30 via-teal-400/15 to-white/0" />
-                      </>
-                    )}
-                    <span className="relative flex-1 truncate">{c.title || 'New chat'}</span>
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setPendingDeleteId(c.id);
-                      }}
-                      title="Delete chat"
-                      className="relative rounded p-1 text-muted-foreground opacity-100 transition hover:bg-bg-200 hover:text-red-600 md:opacity-0 md:group-hover:opacity-100"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </div>
-                );
-              })}
-              {chats.length === 0 && (
-                <div className="px-3 py-2 text-xs text-muted-foreground">No chats yet</div>
-              )}
-            </div>
-          )}
-        </nav>
-        <div className="border-t border-border p-2">
-          <button
-            type="button"
-            onClick={() => setShowSignOut(true)}
-            title="Sign out"
-            className="group flex w-full items-center gap-2 rounded-md px-2 py-2 text-sm text-foreground transition hover:bg-muted"
-          >
-            <div className="h-7 w-7 shrink-0 overflow-hidden rounded-full bg-primary/20">
-              {session.user?.picture_url ? (
-                <img src={session.user.picture_url} alt="" className="h-full w-full object-cover" />
-              ) : null}
-            </div>
-            <span className="flex-1 truncate text-left text-xs font-medium">
-              {session.user ? session.user.email.split('@')[0] : 'user'}
-            </span>
-            <LogOut className="h-4 w-4 text-muted-foreground transition group-hover:text-foreground" />
-          </button>
-        </div>
-      </aside>
-
-      <main className="relative isolate flex min-w-0 flex-1 flex-col overflow-hidden">
-        <ShaderBackground />
-        <div className="relative z-10 flex min-h-0 flex-1 flex-col">
-        <div className="flex items-center justify-between border-b border-border bg-bg-100/80 px-3 py-2 backdrop-blur md:hidden">
-          <button
-            type="button"
-            onClick={() => setSidebarOpen(true)}
+            onClick={() => setDrawerOpen(true)}
             title="Open menu"
-            className="rounded-md p-2 text-text-200 transition hover:bg-muted"
+            className="rounded-lg p-2 text-text-300 transition hover:bg-bg-200 lg:hidden"
           >
             <Menu className="h-5 w-5" />
           </button>
-          <img src="/logo.png" alt="1stAId4SME" className="h-7 w-auto" />
-          <button
-            type="button"
-            onClick={newChat}
-            title="New chat"
-            className="rounded-md p-2 text-text-200 transition hover:bg-muted"
-          >
-            <Plus className="h-5 w-5" />
-          </button>
-        </div>
-        {isEmpty ? (
-          <div className="flex flex-1 flex-col items-center justify-center px-4 py-8">
-            <div className="mb-8 text-center animate-fade-in">
-              <img
-                src="/logo-short.png"
-                alt=""
-                className="h-20 w-auto mx-auto mb-6 object-contain"
-              />
-              <h1 className="text-3xl sm:text-4xl font-serif text-text-200 mb-3 tracking-tight font-[500]">
-                {greeting},{' '}
-                <span className="relative inline-block pb-2">
-                  {userName}
-                  <svg
-                    className="absolute w-[140%] h-[20px] -bottom-1 -left-[5%] text-accent"
-                    viewBox="0 0 140 24"
-                    fill="none"
-                    preserveAspectRatio="none"
-                    aria-hidden="true"
-                  >
-                    <path d="M6 16 Q 70 24, 134 14" stroke="currentColor" strokeWidth="3" strokeLinecap="round" fill="none" />
-                  </svg>
-                </span>
-              </h1>
-              <p className="text-sm text-text-300">
-                Ask anything about the knowledge base — answers are grounded in uploaded documents.
-              </p>
-            </div>
-
-            <ClaudeChatInput
-              onSendMessage={({ message }) => send(message)}
-              disabled={sending}
-              placeholder="Ask a question…"
-            />
+          <div className="min-w-0 flex-1">
+            <AnimatePresence mode="wait" initial={false}>
+              <motion.div
+                key={activeId ?? 'new'}
+                initial={{ opacity: 0, y: 4 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -4 }}
+                transition={{ duration: 0.18 }}
+              >
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <div className="truncate font-serif text-[16px] font-semibold italic text-text-100">
+                    {activeChat?.title && activeChat.title !== 'New chat' ? activeChat.title : 'New chat'}
+                  </div>
+                  <InfoTip side="bottom">
+                    {sourceCount > 0
+                      ? `${sourceCount} source document${sourceCount === 1 ? '' : 's'} referenced in this chat. Answers are grounded in the 1stAId4SME knowledge base.`
+                      : 'Answers are grounded in the 1stAId4SME knowledge base, with sources you can open.'}
+                  </InfoTip>
+                </div>
+              </motion.div>
+            </AnimatePresence>
           </div>
-        ) : (
-          <>
-            <div ref={scrollRef} className="flex-1 overflow-y-auto bg-bg-0">
-              <div className="mx-auto max-w-3xl space-y-6 px-4 py-6 sm:px-6 sm:py-8">
+          <AnimatePresence>
+            {sourceTarget && (
+              <motion.button
+                type="button"
+                initial={{ opacity: 0, scale: 0.92 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.92 }}
+                transition={{ duration: 0.16 }}
+                onClick={closeSource}
+                className="hidden items-center gap-1.5 rounded-full border border-border bg-bg-100 px-3 py-1.5 text-[12px] font-medium text-text-300 transition-colors hover:text-accent lg:flex"
+              >
+                <PanelRightClose className="h-3.5 w-3.5" />
+                Hide source
+              </motion.button>
+            )}
+          </AnimatePresence>
+        </header>
+
+        <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
+          <div className="mx-auto w-full max-w-[720px] px-4 sm:px-6">
+            {isEmpty ? (
+              <motion.div {...RISE} key="empty" className="flex flex-col items-center pb-10 pt-[11vh] text-center">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-border bg-bg-100 shadow-[0_10px_24px_-14px_rgba(70,55,25,0.35)]">
+                  <img src="/logo-short.png" alt="" className="h-10 w-10 object-contain" />
+                </div>
+                <h1 className="mt-6 flex items-center gap-2 font-serif text-3xl font-semibold tracking-tight text-accent sm:text-[2.2rem]">
+                  {greeting}, {firstName}
+                  <InfoTip side="bottom" width="w-72">
+                    Ask anything about the knowledge base. Answers are grounded in the uploaded documents, with sources you can open. You can also attach images and documents.
+                  </InfoTip>
+                </h1>
+                <div className="mt-9 grid w-full grid-cols-1 gap-2.5 sm:grid-cols-2">
+                  {STARTERS.map((s, i) => (
+                    <motion.button
+                      key={s}
+                      type="button"
+                      initial={{ opacity: 0, y: 10 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.36, ease: EASE, delay: 0.12 + i * 0.06 }}
+                      onClick={() => send(s)}
+                      className="group flex items-start gap-3 rounded-2xl border border-border bg-bg-100 px-4 py-3.5 text-left text-[13.5px] text-text-200 shadow-[0_6px_18px_-14px_rgba(70,55,25,0.4)] transition-all duration-200 hover:-translate-y-0.5 hover:border-accent/30 hover:text-text-100 hover:shadow-[0_12px_24px_-14px_rgba(15,94,94,0.35)]"
+                    >
+                      <Sparkles className="mt-0.5 h-4 w-4 shrink-0 text-accent/60 transition-colors group-hover:text-accent" />
+                      {s}
+                    </motion.button>
+                  ))}
+                </div>
+              </motion.div>
+            ) : (
+              <div className="flex flex-col gap-9 pb-8 pt-4">
                 {messages.map((m) => (
-                  <MessageBubble key={m.id} msg={m} onOpenSource={openSource} />
+                  <MessageRow
+                    key={m.id}
+                    msg={m}
+                    onOpenSource={openSource}
+                    activeFileId={sourceTarget?.fileId ?? null}
+                  />
                 ))}
               </div>
-            </div>
-
-            <footer className="bg-bg-0 pb-[max(1rem,env(safe-area-inset-bottom))] pt-2">
-              <ClaudeChatInput
-                onSendMessage={({ message }) => send(message)}
-                disabled={sending}
-                placeholder="Ask a question…"
-                showFooterNote={false}
-              />
-            </footer>
-          </>
-        )}
+            )}
+          </div>
         </div>
+
+        <footer className="shrink-0 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1 sm:px-6">
+          <div className="mx-auto w-full max-w-[720px]">
+            <Composer
+              value={draft}
+              onChange={setDraft}
+              onSubmit={() => send(draft)}
+              onStop={stop}
+              streaming={sending}
+              attachments={att.items}
+              onAddFiles={att.add}
+              onRemoveAttachment={att.remove}
+              autoFocus
+              placeholder={isEmpty ? 'Ask a question…' : 'Ask a follow-up question…'}
+            />
+          </div>
+        </footer>
       </main>
 
-      <SourcePanel target={sourceTarget} onClose={() => setSourceTarget(null)} />
+      <SourcePanel target={sourceTarget} onClose={closeSource} />
 
-      {pendingDeleteChat && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm animate-fade-in"
-          onClick={() => setPendingDeleteId(null)}
-        >
-          <div
-            className="w-[92%] max-w-sm rounded-2xl border border-bg-300 bg-bg-100 p-6 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-red-50">
-              <Trash2 className="h-6 w-6 text-red-600" />
-            </div>
-            <h2 className="text-lg font-semibold text-text-100">Delete chat?</h2>
-            <p className="mt-1 text-sm text-text-300">
-              "{pendingDeleteChat.title || 'New chat'}" and all of its messages will be
-              permanently deleted. This cannot be undone.
-            </p>
-            <div className="mt-6 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setPendingDeleteId(null)}
-                className="rounded-md border border-bg-300 px-4 py-2 text-sm font-medium text-text-200 transition hover:bg-bg-200"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  const id = pendingDeleteChat.id;
-                  setPendingDeleteId(null);
-                  deleteChat(id);
-                }}
-                className="rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-red-700"
-              >
-                Delete
-              </button>
-            </div>
-          </div>
+      <Dialog open={!!pendingDeleteChat} onClose={() => setPendingDeleteId(null)}>
+        <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-danger-soft">
+          <Trash2 className="h-6 w-6 text-danger" />
         </div>
-      )}
+        <h2 className="font-serif text-xl font-semibold text-text-100">Delete chat?</h2>
+        <p className="mt-1 text-sm text-text-300">
+          "{pendingDeleteChat?.title || 'New chat'}" and all of its messages will be permanently deleted. This cannot be undone.
+        </p>
+        <div className="mt-6 flex justify-end gap-2">
+          <button type="button" onClick={() => setPendingDeleteId(null)} className="btn-ghost">
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              const id = pendingDeleteId;
+              setPendingDeleteId(null);
+              if (id) deleteChat(id);
+            }}
+            className="btn-danger"
+          >
+            Delete
+          </button>
+        </div>
+      </Dialog>
 
-      {showSignOut && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm animate-fade-in"
-          onClick={() => setShowSignOut(false)}
-        >
-          <div
-            className="w-[92%] max-w-sm rounded-2xl border border-bg-300 bg-bg-100 p-6 shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent/10">
-              <LogOut className="h-6 w-6 text-accent" />
-            </div>
-            <h2 className="text-lg font-semibold text-text-100">Sign out?</h2>
-            <p className="mt-1 text-sm text-text-300">
-              You'll need to sign in again to return to your chats.
-            </p>
-            <div className="mt-6 flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setShowSignOut(false)}
-                className="rounded-md border border-bg-300 px-4 py-2 text-sm font-medium text-text-200 transition hover:bg-bg-200"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setShowSignOut(false);
-                  logoutUser();
-                }}
-                className="rounded-md bg-accent px-4 py-2 text-sm font-medium text-white transition hover:bg-accent-hover"
-              >
-                Sign out
-              </button>
-            </div>
-          </div>
+      <Dialog open={showSignOut} onClose={() => setShowSignOut(false)}>
+        <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-accent/10">
+          <LogOut className="h-6 w-6 text-accent" />
         </div>
-      )}
-      </div>
+        <h2 className="font-serif text-xl font-semibold text-text-100">Sign out?</h2>
+        <p className="mt-1 text-sm text-text-300">You'll need to sign in again to return to your chats.</p>
+        <div className="mt-6 flex justify-end gap-2">
+          <button type="button" onClick={() => setShowSignOut(false)} className="btn-ghost">
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setShowSignOut(false);
+              logoutUser();
+            }}
+            className="btn-primary"
+          >
+            Sign out
+          </button>
+        </div>
+      </Dialog>
     </div>
   );
 }
 
-function MessageBubble({
-  msg,
-  onOpenSource,
-}: {
-  msg: Msg;
-  onOpenSource: (c: Citation) => void;
-}) {
-  if (msg.role === 'user') {
-    return (
-      <div className="flex justify-end">
-        <div className="max-w-[85%] whitespace-pre-wrap break-words rounded-lg bg-primary px-4 py-2.5 text-sm text-primary-foreground">
-          {msg.content}
-        </div>
-      </div>
-    );
-  }
-  return <AssistantMessage msg={msg as AssistantMsg} onOpenSource={onOpenSource} />;
+/** Animated modal shell with scrim and scale-in card. */
+function Dialog({ open, onClose, children }: { open: boolean; onClose: () => void; children: ReactNode }) {
+  return (
+    <AnimatePresence>
+      {open && (
+        <motion.div
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.18 }}
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-scrim backdrop-blur-sm"
+          onClick={onClose}
+        >
+          <motion.div
+            initial={{ opacity: 0, scale: 0.95, y: 8 }}
+            animate={{ opacity: 1, scale: 1, y: 0 }}
+            exit={{ opacity: 0, scale: 0.97, y: 4 }}
+            transition={{ duration: 0.24, ease: [0.23, 1, 0.32, 1] }}
+            className="panel w-[92%] max-w-sm p-6"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {children}
+          </motion.div>
+        </motion.div>
+      )}
+    </AnimatePresence>
+  );
 }
