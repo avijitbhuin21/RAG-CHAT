@@ -1,10 +1,18 @@
+import re
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
 
+
+def _normalize_db_url(url: str) -> str:
+    """Point any Postgres URL variant (postgres://, postgresql+psycopg://, ...) at the installed psycopg2 driver."""
+    return re.sub(r"^postgres(?:ql)?(?:\+[a-z0-9_]+)?://", "postgresql+psycopg2://", url, count=1)
+
+
 engine = create_engine(
-    settings.DATABASE_URL,
+    _normalize_db_url(settings.DATABASE_URL),
     pool_pre_ping=False,
     pool_recycle=280,
     pool_size=5,
