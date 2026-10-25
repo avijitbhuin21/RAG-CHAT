@@ -22,11 +22,23 @@ class AdminSessionInfo(BaseModel):
     type: Literal["admin"] = "admin"
 
 
+class GuestUsageInfo(BaseModel):
+    used: int
+    limit: int
+    remaining: int
+    resets_at: datetime | None = None
+
+
+class GuestSessionInfo(GuestUsageInfo):
+    guest_id: UUID
+
+
 class SessionResponse(BaseModel):
     # Both can be populated in the same browser when a user is also signed in
     # as admin — each lives in its own cookie (user_session / admin_session).
     user: UserSessionInfo | None = None
     admin: AdminSessionInfo | None = None
+    guest: GuestSessionInfo | None = None
 
 
 # ---------- admin files ----------
@@ -78,3 +90,13 @@ class MessageOut(BaseModel):
 class SendMessageRequest(BaseModel):
     content: str = ""
     attachment_ids: list[str] = []
+
+
+class GuestHistoryItem(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = ""
+    attachment_ids: list[str] = []
+
+
+class GuestSendMessageRequest(SendMessageRequest):
+    history: list[GuestHistoryItem] = []

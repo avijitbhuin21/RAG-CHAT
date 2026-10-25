@@ -43,6 +43,8 @@ class Settings(BaseSettings):
     LLM_MAX_OUTPUT_TOKENS: int = 32000
     CHAT_HISTORY_MAX_MESSAGES: int = 40
     CHAT_RATE_LIMIT_PER_HOUR: int = 100
+    GUEST_MESSAGE_LIMIT: int = 50
+    GUEST_WINDOW_HOURS: int = 24
 
     DATABASE_URL: str
 

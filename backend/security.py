@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from fastapi import Cookie, Depends, HTTPException, Response, status
+from fastapi import Cookie, Depends, HTTPException, Request, Response, status
 from jose import JWTError, jwt
 
 from .config import settings
@@ -11,6 +11,7 @@ from .config import settings
 # (and vice versa). A single browser can hold both sessions at the same time.
 USER_COOKIE_NAME = "user_session"
 ADMIN_COOKIE_NAME = "admin_session"
+GUEST_COOKIE_NAME = "guest_session"
 
 
 def create_jwt(claims: dict[str, Any]) -> str:
@@ -50,6 +51,29 @@ def clear_admin_session_cookie(resp: Response) -> None:
     resp.delete_cookie(ADMIN_COOKIE_NAME, path="/")
 
 
+def set_guest_session_cookie(resp: Response, token: str) -> None:
+    """Store the guest session JWT in its own cookie."""
+    _set_cookie(resp, GUEST_COOKIE_NAME, token)
+
+
+def clear_guest_session_cookie(resp: Response) -> None:
+    """Remove the guest session cookie."""
+    resp.delete_cookie(GUEST_COOKIE_NAME, path="/")
+
+
+def client_ip(request: Request) -> str:
+    """Resolve the caller's IP, preferring proxy-provided headers."""
+    real = request.headers.get("x-real-ip")
+    if real and real.strip():
+        return real.strip()[:64]
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        first = fwd.split(",")[0].strip()
+        if first:
+            return first[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
 def verify_admin_password(password: str) -> bool:
     return password == settings.ADMIN_PASSWORD
 
@@ -87,6 +111,34 @@ def optional_admin_claims(
     if claims and claims.get("type") == "admin":
         return claims
     return None
+
+
+def optional_guest_claims(
+    token: str | None = Cookie(default=None, alias=GUEST_COOKIE_NAME),
+) -> dict | None:
+    """Return decoded guest claims from the guest cookie, if valid."""
+    claims = _decode_or_none(token)
+    if claims and claims.get("type") == "guest":
+        return claims
+    return None
+
+
+def require_guest(claims: dict | None = Depends(optional_guest_claims)) -> dict:
+    """Require a valid guest session."""
+    if claims is None:
+        raise _unauthorized()
+    return claims
+
+
+def require_chat_identity(
+    user: dict | None = Depends(optional_user_claims),
+    guest: dict | None = Depends(optional_guest_claims),
+) -> dict:
+    """Accept either a signed-in user or a guest, preferring the user."""
+    claims = user or guest
+    if claims is None:
+        raise _unauthorized()
+    return claims
 
 
 def require_user(claims: dict | None = Depends(optional_user_claims)) -> dict:

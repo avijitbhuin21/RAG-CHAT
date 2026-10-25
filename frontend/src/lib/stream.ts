@@ -1,3 +1,4 @@
+import { ApiError } from './api';
 import { API_BASE } from './apiBase';
 
 export type UploadProgress = { loaded: number; total: number };
@@ -37,7 +38,12 @@ export async function streamSSE(
     headers: { Accept: 'text/event-stream', ...(init.headers ?? {}) },
   });
   if (!res.ok || !res.body) {
-    throw new Error(`stream failed: ${res.status}`);
+    const raw = await res.text().catch(() => '');
+    let body: unknown = raw;
+    try {
+      body = JSON.parse(raw);
+    } catch {}
+    throw new ApiError(res.status, `stream failed: ${res.status}`, body);
   }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();

@@ -19,6 +19,7 @@ export function ThreadRail({
   onNew,
   onDelete,
   onSignOut,
+  emptyText = 'No chats yet',
 }: {
   threads: RailThread[];
   activeId: string | null;
@@ -27,6 +28,7 @@ export function ThreadRail({
   onNew: () => void;
   onDelete: (id: string) => void;
   onSignOut: () => void;
+  emptyText?: string;
 }) {
   const [query, setQuery] = useState('');
   const [searching, setSearching] = useState(false);
@@ -159,7 +161,7 @@ export function ThreadRail({
             </Group>
           ))}
           {threads.length === 0 && (
-            <p className="px-2 py-6 text-center text-xs text-text-400">No chats yet</p>
+            <p className="px-2 py-6 text-center text-xs text-text-400">{emptyText}</p>
           )}
           {threads.length > 0 && filtered.length === 0 && (
             <p className="px-2 py-6 text-center text-xs text-text-400">Nothing matches “{query}”.</p>

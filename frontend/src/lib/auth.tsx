@@ -12,21 +12,34 @@ export type UserSession = {
 
 export type AdminSession = { type: 'admin' };
 
+export type GuestUsage = {
+  used: number;
+  limit: number;
+  remaining: number;
+  resets_at: string | null;
+};
+
+export type GuestSession = GuestUsage & { guest_id: string };
+
 // A single browser can hold a user session AND an admin session at the same
 // time (each in its own cookie). `null` in either slot means not signed in
 // for that role.
 export type Session = {
   user: UserSession | null;
   admin: AdminSession | null;
+  guest: GuestSession | null;
 };
 
-const EMPTY_SESSION: Session = { user: null, admin: null };
+const EMPTY_SESSION: Session = { user: null, admin: null, guest: null };
 
 type Ctx = {
   session: Session;
   loading: boolean;
   refresh: () => Promise<void>;
+  startGuest: () => Promise<void>;
+  setGuestUsage: (u: GuestUsage) => void;
   logoutUser: () => Promise<void>;
+  logoutGuest: () => Promise<void>;
   logoutAdmin: () => Promise<void>;
   logoutAll: () => Promise<void>;
 };
@@ -40,13 +53,25 @@ export function SessionProvider({ children }: { children: ReactNode }) {
   const refresh = async () => {
     try {
       const data = await api<Session>('/auth/me');
-      setSession({ user: data.user ?? null, admin: data.admin ?? null });
+      setSession({ user: data.user ?? null, admin: data.admin ?? null, guest: data.guest ?? null });
     } catch (e) {
       if (e instanceof ApiError && e.status === 401) setSession(EMPTY_SESSION);
       else throw e;
     } finally {
       setLoading(false);
     }
+  };
+
+  const startGuest = async () => {
+    const guest = await api<GuestSession>('/auth/guest', { method: 'POST' });
+    setSession((s) => ({ ...s, guest }));
+  };
+  const setGuestUsage = (u: GuestUsage) => {
+    setSession((s) => (s.guest ? { ...s, guest: { ...s.guest, ...u } } : s));
+  };
+  const logoutGuest = async () => {
+    await api('/auth/logout?which=guest', { method: 'POST' });
+    setSession((s) => ({ ...s, guest: null }));
   };
 
   const logoutUser = async () => {
@@ -68,7 +93,17 @@ export function SessionProvider({ children }: { children: ReactNode }) {
 
   return (
     <SessionContext.Provider
-      value={{ session, loading, refresh, logoutUser, logoutAdmin, logoutAll }}
+      value={{
+        session,
+        loading,
+        refresh,
+        startGuest,
+        setGuestUsage,
+        logoutUser,
+        logoutGuest,
+        logoutAdmin,
+        logoutAll,
+      }}
     >
       {children}
     </SessionContext.Provider>
@@ -85,7 +120,7 @@ export function RequireUser({ children }: { children: ReactNode }) {
   const { session, loading } = useSession();
   const loc = useLocation();
   if (loading) return <FullScreenLoader />;
-  if (!session.user) return <Navigate to="/login" state={{ from: loc }} replace />;
+  if (!session.user && !session.guest) return <Navigate to="/login" state={{ from: loc }} replace />;
   return <>{children}</>;
 }
 

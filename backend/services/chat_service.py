@@ -419,6 +419,8 @@ async def stream_chat(
     user_message: str,
     user_email: str | None = None,
     attachments: list[dict] | None = None,
+    history: list[dict] | None = None,
+    persist: bool = True,
 ) -> AsyncIterator[dict]:
     prefix = _prefix(chat_id, user_email)
     atts = attachments or []
@@ -435,9 +437,10 @@ async def stream_chat(
     yield {"type": "thinking_start"}
 
     t_db = time.perf_counter()
-    history = await asyncio.to_thread(
-        _load_history_authz, chat_id, user_id, settings.CHAT_HISTORY_MAX_MESSAGES
-    )
+    if history is None:
+        history = await asyncio.to_thread(
+            _load_history_authz, chat_id, user_id, settings.CHAT_HISTORY_MAX_MESSAGES
+        )
     if history is None:
         log.warning("%s chat not found or not owned by user — aborting", prefix)
         yield {"type": "error", "message": "chat not found"}
@@ -450,7 +453,7 @@ async def stream_chat(
         except Exception:
             log.exception("%s FAILED to persist user message", prefix)
 
-    user_save_task = _track(asyncio.create_task(_save_user()))
+    user_save_task = _track(asyncio.create_task(_save_user())) if persist else None
 
     llm_text = user_message.strip() or ATTACHMENT_ONLY_PROMPT
     try:
@@ -698,8 +701,14 @@ async def stream_chat(
         yield {"type": "done", "message_id": str(msg_id)}
         return
     yield {"type": "done", "message_id": str(msg_id)}
+    if not persist:
+        log.info(
+            "%s ====== ephemeral stream done in %.2fs (not persisted) ======",
+            prefix,
+            time.perf_counter() - task_t0,
+        )
+        return
     log.info(
-        "%s ====== stream done in %.2fs (persisting in background) ======",
         prefix,
         time.perf_counter() - task_t0,
     )

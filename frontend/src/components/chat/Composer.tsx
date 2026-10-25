@@ -18,6 +18,7 @@ export function Composer({
   onRemoveAttachment,
   placeholder = 'Ask anything about your documents…',
   autoFocus,
+  disabled = false,
 }: {
   value: string;
   onChange: (v: string) => void;
@@ -29,6 +30,7 @@ export function Composer({
   onRemoveAttachment: (key: string) => void;
   placeholder?: string;
   autoFocus?: boolean;
+  disabled?: boolean;
 }) {
   const ref = useRef<HTMLTextAreaElement>(null);
   const imageInput = useRef<HTMLInputElement>(null);
@@ -60,7 +62,7 @@ export function Composer({
 
   const uploading = attachments.some((a) => a.status === 'uploading');
   const readyCount = attachments.filter((a) => a.status === 'ready').length;
-  const canSend = (value.trim().length > 0 || readyCount > 0) && !streaming && !uploading;
+  const canSend = (value.trim().length > 0 || readyCount > 0) && !streaming && !uploading && !disabled;
 
   const pick = (input: HTMLInputElement | null) => {
     setMenuOpen(false);
@@ -90,7 +92,10 @@ export function Composer({
       onDragLeave={(e) => onDrag(e, 'leave')}
       onDragOver={(e) => onDrag(e, 'over')}
       onDrop={(e) => onDrag(e, 'drop')}
-      className="relative rounded-[26px] border border-border bg-bg-100 p-1 shadow-[0_10px_30px_-16px_rgba(70,55,25,0.25)] transition-shadow duration-200 focus-within:border-accent/30 focus-within:shadow-[0_14px_34px_-14px_rgba(15,94,94,0.28)]"
+      className={cn(
+        'relative rounded-[26px] border border-border bg-bg-100 p-1 shadow-[0_10px_30px_-16px_rgba(70,55,25,0.25)] transition-shadow duration-200 focus-within:border-accent/30 focus-within:shadow-[0_14px_34px_-14px_rgba(15,94,94,0.28)]',
+        disabled && 'pointer-events-none opacity-60',
+      )}
     >
       <div className="rounded-[22px] bg-bg-0">
         <AnimatePresence initial={false}>
@@ -135,7 +140,8 @@ export function Composer({
             }
           }}
           placeholder={placeholder}
-          className="block w-full resize-none bg-transparent px-4 pb-2 pt-3.5 text-[14.5px] leading-relaxed text-text-100 outline-none placeholder:text-text-500"
+          disabled={disabled}
+          className="block w-full resize-none bg-transparent px-4 pb-2 pt-3.5 text-[14.5px] leading-relaxed text-text-100 outline-none placeholder:text-text-500 disabled:cursor-not-allowed"
         />
 
         <div className="flex items-center gap-1 px-2.5 pb-2.5">

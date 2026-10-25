@@ -9,8 +9,9 @@ import { appendThinking, type ChainStep } from '../components/chat/ThinkingChain
 import { useAttachments } from '../components/chat/attachments';
 import { InfoTip } from '../components/ui/InfoTip';
 import { ThreadRail } from '../components/chat/ThreadRail';
-import { api } from '../lib/api';
-import { useSession } from '../lib/auth';
+import { ApiError, api } from '../lib/api';
+import { API_BASE } from '../lib/apiBase';
+import { useSession, type GuestUsage } from '../lib/auth';
 import { EASE, RISE, SLIDE } from '../lib/motion';
 import { streamSSE } from '../lib/stream';
 
@@ -31,7 +32,9 @@ const STARTERS = [
 const PIN_THRESHOLD = 90;
 
 export default function Chat() {
-  const { session, logoutUser } = useSession();
+  const { session, logoutUser, logoutGuest, setGuestUsage } = useSession();
+  const isGuest = !session.user && !!session.guest;
+  const guestLimitReached = isGuest && (session.guest?.remaining ?? 0) <= 0;
   const [chats, setChats] = useState<ChatSummary[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMsg[]>([]);
@@ -77,6 +80,7 @@ export default function Chat() {
   const closeSource = useCallback(() => setSourceTarget(null), []);
 
   async function refreshChats() {
+    if (isGuest) return [];
     const list = await api<ChatSummary[]>('/chat/chats');
     setChats(list);
     return list;
@@ -189,7 +193,16 @@ export default function Chat() {
   async function send(rawText: string) {
     const userText = rawText.trim();
     const metas = att.ready;
-    if ((!userText && metas.length === 0) || sending || att.uploading) return;
+    if ((!userText && metas.length === 0) || sending || att.uploading || guestLimitReached) return;
+    const guestHistory = isGuest
+      ? messagesRef.current
+          .filter((m) => m.role === 'user' || (m.role === 'assistant' && m.content.trim()))
+          .map((m) => ({
+            role: m.role,
+            content: m.content,
+            attachment_ids: (m.attachments ?? []).map((a) => a.id),
+          }))
+      : [];
     setSending(true);
     setDraft('');
     att.clear();
@@ -225,7 +238,7 @@ export default function Chat() {
 
     let chatId = activeId;
     try {
-      if (!chatId) {
+      if (!chatId && !isGuest) {
         const chat = await api<ChatSummary>('/chat/chats', { method: 'POST' });
         chatId = chat.id;
         setChats((prev) => [chat, ...prev]);
@@ -234,15 +247,22 @@ export default function Chat() {
       }
 
       await streamSSE(
-        `/chat/chats/${chatId}/messages`,
+        isGuest ? '/chat/guest/messages' : `/chat/chats/${chatId}/messages`,
         {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: userText, attachment_ids: metas.map((m) => m.id) }),
+          body: JSON.stringify({
+            content: userText,
+            attachment_ids: metas.map((m) => m.id),
+            ...(isGuest ? { history: guestHistory } : {}),
+          }),
           signal: controller.signal,
         },
         (event) => {
           switch (event.type) {
+            case 'guest_usage':
+              setGuestUsage(event.usage);
+              return;
             case 'thinking_delta':
               pendingThinking.current += event.content ?? '';
               schedule();
@@ -304,8 +324,15 @@ export default function Chat() {
       );
     } catch (e) {
       flush();
+      const body = e instanceof ApiError ? (e.body as { code?: string; usage?: GuestUsage } | undefined) : undefined;
       if (controller.signal.aborted) {
         updateLast((m) => ({ ...m, error: m.content ? null : 'Stopped before an answer was generated.' }));
+      } else if (e instanceof ApiError && e.status === 429 && body?.code === 'guest_limit') {
+        if (body.usage) setGuestUsage(body.usage);
+        updateLast((m) => ({
+          ...m,
+          error: 'Guest limit reached. Sign in with Google to keep chatting.',
+        }));
       } else {
         updateLast((m) => ({ ...m, error: `Something went wrong: ${String(e)}` }));
       }
@@ -315,14 +342,16 @@ export default function Chat() {
       setSending(false);
       abortRef.current = null;
       if (chatId) inlineCreatedRef.current.delete(chatId);
-      refreshChats();
+      if (!isGuest) refreshChats();
     }
   }
 
   const isEmpty = messages.length === 0;
   const userName = session.user
     ? session.user.email.split('@')[0].replace(/[._]/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
-    : 'there';
+    : isGuest
+      ? 'Guest'
+      : 'there';
   const firstName = userName.split(' ')[0];
   const initials =
     userName
@@ -346,10 +375,13 @@ export default function Chat() {
       activeId={activeId}
       account={{
         name: userName,
-        email: session.user?.email ?? '',
+        email: isGuest
+          ? `${session.guest?.remaining ?? 0} of ${session.guest?.limit ?? 0} messages left today`
+          : session.user?.email ?? '',
         initials,
         photo: session.user?.picture_url ?? null,
       }}
+      emptyText={isGuest ? "Guest chats aren't saved" : undefined}
       onOpen={selectChat}
       onNew={newChat}
       onDelete={setPendingDeleteId}
@@ -484,6 +516,18 @@ export default function Chat() {
 
         <footer className="shrink-0 px-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] pt-1 sm:px-6">
           <div className="mx-auto w-full max-w-[720px]">
+            {guestLimitReached && (
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-2xl border border-border bg-bg-100 px-4 py-3 text-[13px] text-text-200">
+                <span>
+                  Guest limit reached — sign in with Google to continue.
+                  {session.guest?.resets_at &&
+                    ` Resets ${new Date(session.guest.resets_at).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })}.`}
+                </span>
+                <a href={`${API_BASE}/auth/google/login`} className="btn-primary px-3 py-1.5 text-[12.5px]">
+                  Sign in with Google
+                </a>
+              </div>
+            )}
             <Composer
               value={draft}
               onChange={setDraft}
@@ -494,7 +538,14 @@ export default function Chat() {
               onAddFiles={att.add}
               onRemoveAttachment={att.remove}
               autoFocus
-              placeholder={isEmpty ? 'Ask a question…' : 'Ask a follow-up question…'}
+              disabled={guestLimitReached}
+              placeholder={
+                guestLimitReached
+                  ? 'Guest limit reached'
+                  : isEmpty
+                    ? 'Ask a question…'
+                    : 'Ask a follow-up question…'
+              }
             />
           </div>
         </footer>
@@ -533,7 +584,11 @@ export default function Chat() {
           <LogOut className="h-6 w-6 text-accent" />
         </div>
         <h2 className="font-serif text-xl font-semibold text-text-100">Sign out?</h2>
-        <p className="mt-1 text-sm text-text-300">You'll need to sign in again to return to your chats.</p>
+        <p className="mt-1 text-sm text-text-300">
+          {isGuest
+            ? "Your guest chat will be lost. Your daily message limit stays tied to this network."
+            : "You'll need to sign in again to return to your chats."}
+        </p>
         <div className="mt-6 flex justify-end gap-2">
           <button type="button" onClick={() => setShowSignOut(false)} className="btn-ghost">
             Cancel
@@ -542,7 +597,8 @@ export default function Chat() {
             type="button"
             onClick={() => {
               setShowSignOut(false);
-              logoutUser();
+              if (isGuest) logoutGuest();
+              else logoutUser();
             }}
             className="btn-primary"
           >

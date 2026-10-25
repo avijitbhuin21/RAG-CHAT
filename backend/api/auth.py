@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import RedirectResponse
@@ -6,17 +8,22 @@ from sqlalchemy.orm import Session
 from ..config import settings
 from ..db import get_db
 from ..models import User
-from ..schemas import AdminLoginRequest, SessionResponse, UserSessionInfo
+from ..schemas import AdminLoginRequest, GuestSessionInfo, SessionResponse, UserSessionInfo
 from ..security import (
     clear_admin_session_cookie,
+    clear_guest_session_cookie,
     clear_user_session_cookie,
+    client_ip,
     create_jwt,
     optional_admin_claims,
+    optional_guest_claims,
     optional_user_claims,
     set_admin_session_cookie,
+    set_guest_session_cookie,
     set_user_session_cookie,
     verify_admin_password,
 )
+from ..services import guest as guest_svc
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -73,6 +80,21 @@ async def google_callback(request: Request, db: Session = Depends(get_db)):
     return redirect
 
 
+@router.post("/guest", response_model=GuestSessionInfo)
+def guest_login(
+    request: Request,
+    response: Response,
+    existing: dict | None = Depends(optional_guest_claims),
+    db: Session = Depends(get_db),
+):
+    """Start (or resume) a guest session whose quota is tied to the caller's IP."""
+    guest_id = existing["user_id"] if existing else str(uuid4())
+    if not existing:
+        token = create_jwt({"sub": guest_id, "type": "guest", "user_id": guest_id, "email": "guest"})
+        set_guest_session_cookie(response, token)
+    return GuestSessionInfo(guest_id=guest_id, **guest_svc.usage(db, client_ip(request)))
+
+
 @router.post("/admin/login")
 def admin_login(body: AdminLoginRequest, response: Response):
     if body.username != settings.ADMIN_USERNAME or not verify_admin_password(body.password):
@@ -91,19 +113,24 @@ def logout(
 
     which=user  -> clear only the user session
     which=admin -> clear only the admin session
-    (default)   -> clear both
+    which=guest -> clear only the guest session
+    (default)   -> clear all
     """
     if which in (None, "user"):
         clear_user_session_cookie(response)
     if which in (None, "admin"):
         clear_admin_session_cookie(response)
+    if which in (None, "guest"):
+        clear_guest_session_cookie(response)
     return {"ok": True}
 
 
 @router.get("/me", response_model=SessionResponse)
 def me(
+    request: Request,
     user_claims: dict | None = Depends(optional_user_claims),
     admin_claims: dict | None = Depends(optional_admin_claims),
+    guest_claims: dict | None = Depends(optional_guest_claims),
     db: Session = Depends(get_db),
 ):
     user: UserSessionInfo | None = None
@@ -117,4 +144,9 @@ def me(
                 picture_url=u.picture_url,
             )
     admin = {"type": "admin"} if admin_claims else None
-    return SessionResponse(user=user, admin=admin)
+    guest: GuestSessionInfo | None = None
+    if guest_claims:
+        guest = GuestSessionInfo(
+            guest_id=guest_claims["user_id"], **guest_svc.usage(db, client_ip(request))
+        )
+    return SessionResponse(user=user, admin=admin, guest=guest)

@@ -1,18 +1,25 @@
 import asyncio
 import json
 import logging
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import SessionLocal, get_db
 from ..models import Chat, FileRecord, Message
-from ..schemas import ChatOut, MessageOut, SendMessageRequest
-from ..security import require_user, user_id_from_claims
+from ..schemas import ChatOut, GuestSendMessageRequest, MessageOut, SendMessageRequest
+from ..security import (
+    client_ip,
+    require_chat_identity,
+    require_guest,
+    require_user,
+    user_id_from_claims,
+)
 from ..services import attachments as attachments_svc
+from ..services import guest as guest_svc
 from ..services import s3 as s3_svc
 from ..services.chat_service import stream_chat
 
@@ -115,7 +122,7 @@ def list_messages(
 @router.post("/attachments")
 async def upload_attachment(
     file: UploadFile = File(...),
-    claims: dict = Depends(require_user),
+    claims: dict = Depends(require_chat_identity),
 ):
     """Accept one chat attachment, validate/extract it and return its metadata."""
     uid = user_id_from_claims(claims)
@@ -130,7 +137,7 @@ async def upload_attachment(
 
 
 @router.get("/attachments/{att_id}")
-async def get_attachment(att_id: str, claims: dict = Depends(require_user)):
+async def get_attachment(att_id: str, claims: dict = Depends(require_chat_identity)):
     """Serve the original bytes of one of the caller's own attachments."""
     uid = user_id_from_claims(claims)
     try:
@@ -221,11 +228,81 @@ async def send_message(
     )
 
 
+@router.post("/guest/messages")
+async def send_guest_message(
+    body: GuestSendMessageRequest,
+    request: Request,
+    claims: dict = Depends(require_guest),
+    db: Session = Depends(get_db),
+):
+    """Stream an answer for a guest without persisting the chat, charging the IP's quota."""
+    uid = user_id_from_claims(claims)
+    if not body.content.strip() and not body.attachment_ids:
+        raise HTTPException(status_code=400, detail="message is empty")
+
+    def _metas(ids: list[str], strict: bool) -> list[dict]:
+        out: list[dict] = []
+        for a in ids:
+            try:
+                out.append(attachments_svc.load_meta(uid, a))
+            except KeyError:
+                if strict:
+                    raise
+        return out
+
+    try:
+        att_metas = await asyncio.to_thread(_metas, body.attachment_ids, True)
+        attachments_svc.validate_counts(att_metas)
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail="unknown attachment") from e
+    except attachments_svc.AttachmentError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    trimmed = body.history[-settings.CHAT_HISTORY_MAX_MESSAGES :]
+    history: list[dict] = []
+    for h in trimmed:
+        metas = await asyncio.to_thread(_metas, h.attachment_ids, False) if h.role == "user" else []
+        if not h.content.strip() and not metas:
+            continue
+        history.append({"role": h.role, "content": h.content, "attachments": metas})
+
+    ip = client_ip(request)
+    allowed, usage = await asyncio.to_thread(guest_svc.consume, db, ip, uid)
+    usage_payload = {
+        **usage,
+        "resets_at": usage["resets_at"].isoformat() if usage["resets_at"] else None,
+    }
+    if not allowed:
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"detail": "guest limit reached", "code": "guest_limit", "usage": usage_payload},
+        )
+
+    chat_id = uuid4()
+    tag = str(chat_id)[:8]
+    log.info("[api %s guest %s] POST /guest/messages (%d chars)", tag, ip, len(body.content))
+
+    async def stream():
+        yield f"data: {json.dumps({'type': 'guest_usage', 'usage': usage_payload})}\n\n"
+        try:
+            async for event in stream_chat(
+                chat_id, uid, body.content, f"guest@{ip}", att_metas, history=history, persist=False
+            ):
+                yield f"data: {json.dumps(event)}\n\n"
+        except Exception:
+            log.exception("[api %s] guest stream generator crashed", tag)
+            yield f"data: {json.dumps({'type': 'error', 'message': 'stream crashed (see server logs)'})}\n\n"
+
+    return StreamingResponse(
+        _with_keepalive(stream()), media_type="text/event-stream", headers=SSE_HEADERS
+    )
+
+
 @router.get("/files/{file_id}")
 async def get_file(
     file_id: UUID,
     name: str | None = None,
-    claims: dict = Depends(require_user),
+    claims: dict = Depends(require_chat_identity),
 ):
     """Stream a source document so the citation side-panel can render it.
     Any signed-in user can read any ingested file — the knowledge base is
