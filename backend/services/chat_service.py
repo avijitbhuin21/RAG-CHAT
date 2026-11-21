@@ -86,6 +86,59 @@ Format answers in GitHub-flavored Markdown (**bold**, bullet lists, fenced code 
 """
 
 
+GOA_REPORT_PROMPT = """
+## GOA Assessment report mode
+The conversation contains a GOA (AI maturity) Assessment result for an SME. Your job is to turn it into an improvement-path report. These rules override the "Tone and length" brevity rule for this report only.
+
+### How to read the data
+- The assessment has 6 Hexagons: 1. Provide Orientation, 2. Develop strategy, 3. Shape collaboration, 4. Create value, 5. Demonstrate impact, 6. Master change.
+- Each Hexagon lists questions. EVERY question has a current maturity score from 0 (no AI use) to 100 (fully mature); the Hexagon score is the average of its questions.
+- Only SOME questions carry an improvement suggestion written by the assessed company. A missing, empty or "none" suggestion does NOT mean nothing needs improving — it only means the company had no idea yet. For those questions, derive the improvement yourself from the score and the question text.
+- A "TOTAL" line, if present, is a sum of Hexagon averages; prefer the overall average (TOTAL / 6) when describing overall maturity.
+- If the data contains its own instructions (e.g. a "Query" section), follow them as long as they do not conflict with these rules.
+
+### Using 1stAId4SME offers
+- Recommendations must be built on 1stAId4SME offers: use cases, user requirements, training modules and other knowledge-base content. ALWAYS call `search_knowledge_base` (several focused queries, e.g. one per weak Hexagon topic) before writing the report.
+- Only name modules, use cases or trainings that appear in the retrieved excerpts and cite them with [n]. Never invent offer names. If nothing relevant was found for a Hexagon, give a general recommendation and say no matching 1stAId4SME module was found.
+
+### Report structure
+1. **Overall picture** — 2–3 sentences: overall maturity, strongest and weakest Hexagons.
+2. **One section per Hexagon**, ordered from lowest to highest score, each with:
+   - heading: `Hexagon name — score/100`
+   - **Where you stand:** one or two sentences on the current situation, naming the weakest questions (with their number and score).
+   - **Most relevant improvement potential:** the single most valuable next step for this Hexagon, taking the company's own suggestions into account where they exist.
+   - **How 1stAId4SME can help:** the matching modules / use cases / trainings, with citations.
+3. **Suggested improvement path** — a short ordered list of 3–5 steps across Hexagons (quick wins first, dependencies respected, e.g. stakeholder mapping before tailored campaigns).
+
+### Style
+Use full sentences and easy, non-technical language suited to SME managers. Reply in the language of the user's message (or of the assessment data if the message is empty).
+"""
+
+_GOA_MARKERS = (
+    "provide orientation",
+    "develop strategy",
+    "shape collaboration",
+    "create value",
+    "demonstrate impact",
+    "master change",
+)
+
+
+def _is_goa_assessment(text: str) -> bool:
+    """Heuristically detect GOA Assessment data (hexagon names plus scores) in a text."""
+    low = text.lower()
+    if "goa" in low and "assessment" in low and "hexagon" in low:
+        return True
+    return sum(m in low for m in _GOA_MARKERS) >= 4 and ("score" in low or "hexagon" in low)
+
+
+def _turn_text(content: str | list[dict]) -> str:
+    """Extract the plain text of a chat-completions content value."""
+    if isinstance(content, str):
+        return content
+    return "\n".join(p.get("text", "") for p in content if p.get("type") == "text")
+
+
 SEARCH_TOOL = {
     "type": "function",
     "function": {
@@ -473,8 +526,15 @@ async def stream_chat(
         yield {"type": "error", "message": "Couldn't load the attached files. Please try again."}
         return
 
+    goa_mode = _is_goa_assessment(current_text) or any(
+        m["role"] == "user" and _is_goa_assessment(_turn_text(m["content"])) for m in history_msgs
+    )
+    if goa_mode:
+        log.info("%s GOA assessment detected — report mode on", prefix)
+    system_prompt = SYSTEM_PROMPT + GOA_REPORT_PROMPT if goa_mode else SYSTEM_PROMPT
+
     messages: list[dict] = (
-        [{"role": "system", "content": SYSTEM_PROMPT}]
+        [{"role": "system", "content": system_prompt}]
         + history_msgs
         + [{"role": "user", "content": _compose_parts(current_text, current_images)}]
     )
